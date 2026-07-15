@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual env (local dev)
+venv/
+.venv/
+
+# Docker
+docker-compose*.yaml
+dockerfile
+Dockerfile
+
+# Output & cache (运行时挂载卷)
+output/
+workspace/
+model_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore

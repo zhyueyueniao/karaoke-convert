@@ -1,0 +1,55 @@
+services:
+  ktv-convert:
+    image: karaoke-tool-ultra255:latest
+    container_name: karaoke-tool-ultra255
+    # 使用 venv 的 python（覆盖镜像 CMD 中可能未正确解析 PATH 的问题）
+    command: /app/venv/bin/python3 /app/app.py
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "7860:7860"
+      - "7861:7861"
+    volumes:
+      # 热更新：宿主机修改代码 后 docker compose restart 即可生效，无需重建镜像
+      - ./app:/app
+      # HuggingFace 模型缓存（stable-ts / faster-whisper / demucs 部分模型）
+      - ./model_cache/huggingface:/root/.cache/huggingface
+      # Torch Hub 模型缓存（Demucs 模型文件）
+      - ./model_cache/torch:/root/.cache/torch
+      # 处理输出持久化（重启不丢结果）
+      #- ./output:/app/output
+      # 宿主机与容器交换文件的共享目录
+      #- ./workspace:/app/workspace
+    environment:
+      - LD_LIBRARY_PATH=/opt/openvino/runtime/lib/intel64:/opt/openvino/runtime/3rdparty/tbb/lib
+      # 帮助 Level Zero 识别 Intel GPU（Z425/Core Ultra 需要）
+      - ZES_ENABLE_SYSMAN=1
+
+      # ---- HuggingFace 国内镜像 ----
+      - HF_ENDPOINT=https://hf-mirror.com
+      # 禁用 Xet/CAS 传输，镜像站不支持
+      - HF_HUB_ENABLE_HF_TRANSFER=0
+      - HF_HUB_DISABLE_XET=1
+      #- KARAOKE_API=1 # 启用 karaoke api
+    deploy:
+      resources:
+        limits:
+          memory: 24G
+        reservations:
+          memory: 8G
+    security_opt:
+      - no-new-privileges:true
+
+    # ---- Intel iGPU 加速 ----
+    # 大部分 NAS（极空间/群晖等）的 render 组名或 GID 与标准发行版不同，
+    # 如果容器无法识别 render 组，在宿主机上执行：
+    #   ls -la /dev/dri/renderD128
+    #   stat -c '%g' /dev/dri/renderD128
+    # 看输出中的组名和 GID，按实际情况填。常见：video(44) / render(109) / render(104)
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      # - render          # Z425 若报错 render 组不存在，注释这一行换成下一行
+      - "992"
+
