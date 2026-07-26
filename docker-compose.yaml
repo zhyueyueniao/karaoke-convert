@@ -21,7 +21,6 @@ services:
       # 宿主机与容器交换文件的共享目录
       #- ./workspace:/app/workspace
     environment:
-      - LD_LIBRARY_PATH=/opt/openvino/runtime/lib/intel64:/opt/openvino/runtime/3rdparty/tbb/lib
       # 帮助 Level Zero 识别 Intel GPU（Z425/Core Ultra 需要）
       - ZES_ENABLE_SYSMAN=1
 

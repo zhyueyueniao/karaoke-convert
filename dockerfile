@@ -2,7 +2,6 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV OPENVINO_VERSION=2025.4.1
 ENV PATH="/app/venv/bin:$PATH"
 ENV HF_HUB_ENABLE_HF_TRANSFER=0
 
@@ -29,25 +28,7 @@ RUN mkdir -p /usr/share/keyrings && \
     intel-level-zero-gpu level-zero && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ==================== Layer 3: OpenVINO 运行时（~600MB，版本固定后几乎不用重建）====================
-RUN OV_URL="https://storage.openvinotoolkit.org/repositories/openvino/packages/${OPENVINO_VERSION}/linux/openvino_toolkit_ubuntu24_${OPENVINO_VERSION}.20426.82bbf0292c5_x86_64.tgz" && \
-    echo "📥 下载 OpenVINO ${OPENVINO_VERSION}..." && \
-    wget -q --show-progress -O /tmp/ov.tgz "${OV_URL}" && \
-    test "$(stat -c%s /tmp/ov.tgz)" -gt 52428800 || { echo "❌ 下载文件过小"; head -c 200 /tmp/ov.tgz; exit 1; } && \
-    tar -xzf /tmp/ov.tgz -C /tmp && \
-    OV_DIR=$(ls -1d /tmp/openvino_toolkit_ubuntu24_* | head -1) && \
-    mkdir -p /opt/openvino && \
-    cp -a "$OV_DIR/runtime" /opt/openvino/ && \
-    cp "$OV_DIR/setupvars.sh" /opt/openvino/ && \
-    rm -rf /tmp/ov.tgz /tmp/openvino_toolkit_ubuntu24_* && \
-    echo '/opt/openvino/runtime/lib/intel64' > /etc/ld.so.conf.d/openvino.conf && \
-    echo '/opt/openvino/runtime/3rdparty/tbb/lib' >> /etc/ld.so.conf.d/openvino.conf && \
-    ldconfig
-
-ENV LD_LIBRARY_PATH="/opt/openvino/runtime/lib/intel64:/opt/openvino/runtime/3rdparty/tbb/lib"
-
-# ==================== Layer 4: Python 依赖 ====================
-# pip 缓存挂载，重复构建时 wheel 包直接复用
+# ==================== Layer 3: Python 依赖（OpenVINO 改用 pip 安装，省去 ~600MB tgz）====================
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m venv /app/venv && \
     pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
@@ -64,7 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     find /app/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; true && \
     find /app/venv -type f -name "*.pyc" -delete 2>/dev/null; true
 
-# ==================== Layer 5: 应用代码 ====================
+# ==================== Layer 4: 应用代码 ====================
 # app.py 等通过 volume 热挂载，这一层只有文件拷贝，瞬间完成
 WORKDIR /app
 COPY app.py api.py config.py model_loader.py processing.py model_manager.py /app/
