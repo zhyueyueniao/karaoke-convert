@@ -248,7 +248,7 @@ def align_lyrics(audio_file, lyrics_text):
             return
         print(f"🎯 对齐中（{len(clean_lines)} 句）: {audio_file}")
         yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🎯 对齐 {len(clean_lines)} 句...", gr.update(interactive=False)
-        result = model_loader.model.align(audio_file, clean_text, word_timestamps=True)
+        result = model_loader.model.align(audio_file, clean_text, language=config.WHISPER_LANGUAGE, word_timestamps=True)
         # 逐词 LRC
         lrc_word_lines = []
         for seg in result.segments:

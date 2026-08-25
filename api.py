@@ -213,6 +213,10 @@ def _stream_separate(job_id: str, audio_path: str):
             if vocal: result["vocal_path"] = vocal
             if accomp: result["accomp_path"] = accomp
             yield _sse("progress", {"progress": status})
+        with _lock:
+            err = jobs.get(job_id, {}).get("error")
+        if err:
+            result["error"] = err
         _update_job(job_id, status="done", **result)
         yield _sse("done", {"job_id": job_id, **result})
     except Exception as e:
@@ -231,6 +235,10 @@ def _stream_align(job_id: str, audio_path: str, lyrics_text: str | None = None):
             if lrc_word: result["lrc_word"] = lrc_word
             if lrc_line: result["lrc_line"] = lrc_line
             yield _sse("progress", {"progress": status})
+        with _lock:
+            err = jobs.get(job_id, {}).get("error")
+        if err:
+            result["error"] = err
         _update_job(job_id, status="done", **result)
         yield _sse("done", {"job_id": job_id, **result})
     except Exception as e:

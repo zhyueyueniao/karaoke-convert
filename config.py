@@ -100,6 +100,8 @@ def _save_model_pref(key: str, value: str):
 
 DEMUCS_MODEL = _load_model_pref("DEMUCS_MODEL", "mdx_extra")
 WHISPER_MODEL = _load_model_pref("WHISPER_MODEL", "medium")
+# 语音识别/对齐的目标语言（stable_whisper 的 align() 强制要求显式传 language）
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "zh")
 
 AVAILABLE_WHISPER = ["tiny", "base", "small", "medium", "large-v3"]
 AVAILABLE_DEMUCS  = ["mdx_extra", "mdx_q", "htdemucs", "htdemucs_ft", "mdx"]
