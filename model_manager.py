@@ -6,7 +6,9 @@ import subprocess
 import time
 import gradio as gr
 from config import (HF_CACHE, HF_ENDPOINT, TORCH_CHECKPOINTS,TORCH_MARKERS, AVAILABLE_WHISPER, AVAILABLE_DEMUCS,
-                    WHISPER_SIZES, DEMUCS_SIZES)
+                    WHISPER_SIZES, DEMUCS_SIZES,
+                    OPENVIDEO_MODELS_DIR, AVAILABLE_AIMV_MODELS, AIMV_MODEL_REPOS,
+                    AIMV_MODEL_OV_DIRS, AIMV_MODEL_SIZES)
 
 
 # ---- 工具函数 ----
@@ -347,4 +349,226 @@ def demucs_del_btns(model_name):
     for msg in delete_demucs_model(model_name):
         done, ok = _is_done(msg), "✅" in msg
         size_update = gr.update(value=f"**{model_name}**  {DEMUCS_SIZES.get(model_name, '')}") if ok else gr.update()
+        yield msg, gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=not ok), size_update
+
+
+# ==================== AI MV 生成模型（LTX-Video / SD / SDXL）====================
+
+def is_aimv_cached(model_name: str) -> bool:
+    """[检测] AI MV 模型 IR 是否已就绪（目录存在且含 .xml 权重）"""
+    d = AIMV_MODEL_OV_DIRS.get(model_name)
+    if not d or not os.path.isdir(d):
+        return False
+    for root, _, files in os.walk(d):
+        if any(f.endswith(".xml") for f in files):
+            return True
+    return False
+
+def get_aimv_cache_size(model_name: str) -> str:
+    """[大小] 计算 AI MV 模型 IR 目录实际磁盘占用"""
+    d = AIMV_MODEL_OV_DIRS.get(model_name)
+    if not d or not os.path.isdir(d):
+        return AIMV_MODEL_SIZES.get(model_name, "")
+    total = 0
+    for root, _, files in os.walk(d):
+        for f in files:
+            fp = os.path.join(root, f)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+    if total > 0:
+        return _format_size(total)
+    return AIMV_MODEL_SIZES.get(model_name, "")
+
+def delete_aimv_model(model_name: str):
+    """[删除] 删除 AI MV 模型 IR 目录"""
+    if model_name not in AVAILABLE_AIMV_MODELS:
+        yield f"❌ 无效模型: {model_name}"
+        return
+    d = AIMV_MODEL_OV_DIRS[model_name]
+    if not os.path.exists(d):
+        yield f"⚠️ {model_name} 未缓存，无需删除"
+        return
+    yield f"🗑 删除 {model_name}..."
+    try:
+        shutil.rmtree(d, ignore_errors=True)
+        yield f"✅ {model_name} 已删除"
+    except Exception as e:
+        yield f"❌ 删除失败: {str(e)}"
+
+
+def download_aimv_model(model_name: str, force: bool = False):
+    """[下载] AI MV 生成模型
+    
+    - SD / SDXL：官方已提供 OpenVINO IR，直接用 snapshot_download 拉到 openvino 缓存目录
+    - LTX-Video：先 snapshot_download 源模型，再经 optimum-cli export openvino 转 IR（需 optimum-intel）
+    - force=True：清除旧缓存重新下载/转换
+    """
+    if model_name not in AVAILABLE_AIMV_MODELS:
+        yield f"❌ 无效模型: {model_name}"
+        return
+    out_dir = AIMV_MODEL_OV_DIRS[model_name]
+    if not force and is_aimv_cached(model_name):
+        yield f"✅ {model_name} 已缓存，无需下载"
+        return
+    if force:
+        yield f"🗑 清除旧缓存..."
+        if os.path.exists(out_dir):
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    repo_id = AIMV_MODEL_REPOS[model_name]
+    start = time.time()
+
+    if model_name in ("sd15", "sdxl"):
+        # SD / SDXL 官方已转好 IR，直接拉取
+        yield f"📥 下载 {repo_id}（OpenVINO IR）..."
+        try:
+            cmd = """\
+import os, time, threading
+os.environ['HF_ENDPOINT'] = '{hf_endpoint}'
+from huggingface_hub import snapshot_download
+start = time.time()
+stop = threading.Event()
+def heartbeat():
+    while not stop.wait(5):
+        e = int(time.time() - start)
+        print('[' + str(e//60).zfill(2) + ':' + str(e%60).zfill(2) + '] downloading...', flush=True)
+hb = threading.Thread(target=heartbeat, daemon=True)
+hb.start()
+try:
+    print('connecting...', flush=True)
+    snapshot_download('{repo_id}', local_dir='{out_dir}', local_dir_use_symlinks=False, resume_download=True)
+    print('DONE', flush=True)
+finally:
+    stop.set()
+    hb.join(timeout=1)
+""".format(hf_endpoint=HF_ENDPOINT, repo_id=repo_id, out_dir=out_dir)
+            proc = subprocess.Popen(["python3", "-u", "-c", cmd], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True, bufsize=1)
+            out_lines = []
+            for line in proc.stdout:
+                line = line.strip()
+                out_lines.append(line)
+                if not line:
+                    continue
+                if "%" in line:
+                    m = re.search(r"(\d+)%", line)
+                    yield f"⏱️ {_fmt_elapsed(start)} | 📥 下载 {model_name} ... {m.group(1)}%" if m else \
+                         f"⏱️ {_fmt_elapsed(start)} | 📥 {line}"
+                else:
+                    yield f"⏱️ {_fmt_elapsed(start)} | 📥 {line}"
+            proc.wait(timeout=3600)
+            if proc.returncode != 0:
+                err = "\n".join(out_lines[-5:]) if out_lines else "无输出"
+                yield f"⏱️ {_fmt_elapsed(start)} | ❌ 下载失败: {err}"
+                return
+            yield f"⏱️ {_fmt_elapsed(start)} | ✅ {model_name} 下载完成"
+        except subprocess.TimeoutExpired:
+            yield f"❌ 下载超时（60分钟），请检查网络后重试"
+        except Exception as e:
+            yield f"❌ 下载异常: {str(e)}"
+        return
+
+    # LTX-Video：先下源模型，再转 OpenVINO IR
+    src_dir = os.path.join(OPENVIDEO_MODELS_DIR, "LTX-Video-src")
+    try:
+        # 1) 下载源模型
+        yield f"📥 下载源模型 {repo_id}（约 12GB，较慢）..."
+        dl_cmd = """\
+import os, time, threading
+os.environ['HF_ENDPOINT'] = '{hf_endpoint}'
+from huggingface_hub import snapshot_download
+start = time.time()
+stop = threading.Event()
+def heartbeat():
+    while not stop.wait(5):
+        e = int(time.time() - start)
+        print('[' + str(e//60).zfill(2) + ':' + str(e%60).zfill(2) + '] downloading source...', flush=True)
+hb = threading.Thread(target=heartbeat, daemon=True)
+hb.start()
+try:
+    print('connecting...', flush=True)
+    snapshot_download('{repo_id}', local_dir='{src_dir}', local_dir_use_symlinks=False, resume_download=True)
+    print('DONE', flush=True)
+finally:
+    stop.set()
+    hb.join(timeout=1)
+""".format(hf_endpoint=HF_ENDPOINT, repo_id=repo_id, src_dir=src_dir)
+        proc = subprocess.Popen(["python3", "-u", "-c", dl_cmd], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        out_lines = []
+        for line in proc.stdout:
+            line = line.strip()
+            out_lines.append(line)
+            if not line:
+                continue
+            yield f"⏱️ {_fmt_elapsed(start)} | 📥 {line}" if "%" not in line else \
+                  f"⏱️ {_fmt_elapsed(start)} | 📥 {line}"
+        proc.wait(timeout=5400)
+        if proc.returncode != 0:
+            err = "\n".join(out_lines[-5:]) if out_lines else "无输出"
+            yield f"⏱️ {_fmt_elapsed(start)} | ❌ 源模型下载失败: {err}"
+            return
+        yield f"⏱️ {_fmt_elapsed(start)} | ✅ 源模型下载完成，开始转换 OpenVINO IR..."
+
+        # 2) 转 OpenVINO IR
+        conv_cmd = (
+            f'optimum-cli export openvino --model "{src_dir}" '
+            f'--task text-to-video --weight-format fp16 "{out_dir}"'
+        )
+        yield f"🔄 转换中：{conv_cmd}"
+        cproc = subprocess.Popen(conv_cmd, shell=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in cproc.stdout:
+            line = line.strip()
+            if line:
+                yield f"⏱️ {_fmt_elapsed(start)} | 🔄 {line}"
+        cproc.wait(timeout=5400)
+        if cproc.returncode != 0:
+            yield (f"⏱️ {_fmt_elapsed(start)} | ❌ 转换失败（exit={cproc.returncode}）。"
+                   f"请确认已安装 optimum-intel，或手动执行：{conv_cmd}")
+            return
+        if not is_aimv_cached(model_name):
+            yield f"⏱️ {_fmt_elapsed(start)} | ⚠️ 转换完成但未检测到 IR 文件，请检查 {out_dir}"
+            return
+        yield f"⏱️ {_fmt_elapsed(start)} | ✅ {model_name} 转换完成（OpenVINO IR 就绪）"
+    except subprocess.TimeoutExpired:
+        yield f"❌ 操作超时（90分钟），请检查网络/磁盘后重试"
+    except Exception as e:
+        yield f"❌ 异常: {str(e)}"
+
+
+def switch_aimv_model(model_name: str) -> str:
+    """[运行时切换] 仅允许切换到已下载的 AI MV 生成模型，立即生效"""
+    import config
+    if model_name not in AVAILABLE_AIMV_MODELS:
+        gr.Warning(f"无效模型: {model_name}")
+        return config.DEFAULT_AIMV_MODEL
+    if model_name == config.DEFAULT_AIMV_MODEL:
+        return model_name
+    if not is_aimv_cached(model_name):
+        gr.Warning(f"{model_name} 未下载，请在模型管理 Tab 点击 📥下载")
+        return config.DEFAULT_AIMV_MODEL
+    config.DEFAULT_AIMV_MODEL = model_name
+    config._save_model_pref("AIMV_MODEL", model_name)
+    gr.Info(f"已切换到 {model_name}")
+    return model_name
+
+
+# ---- AI MV 模型 UI 按钮包装生成器 ----
+def aimv_dl_btn(model_name):
+    for msg in download_aimv_model(model_name):
+        done, ok = _is_done(msg), "✅" in msg
+        size_update = gr.update(value=f"**{model_name}**  {get_aimv_cache_size(model_name)}") if ok else gr.update()
+        yield msg, gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=ok), size_update
+
+def aimv_redl_btns(model_name):
+    for msg in download_aimv_model(model_name, force=True):
+        done, ok = _is_done(msg), "✅" in msg
+        size_update = gr.update(value=f"**{model_name}**  {get_aimv_cache_size(model_name)}") if ok else gr.update()
+        yield msg, gr.update(visible=False), gr.update(interactive=done, visible=True), gr.update(interactive=done, visible=True), size_update
+
+def aimv_del_btns(model_name):
+    for msg in delete_aimv_model(model_name):
+        done, ok = _is_done(msg), "✅" in msg
+        size_update = gr.update(value=f"**{model_name}**  {AIMV_MODEL_SIZES.get(model_name, '')}") if ok else gr.update()
         yield msg, gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=not ok), size_update

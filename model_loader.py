@@ -112,6 +112,12 @@ def get_status_html():
         except Exception as e:
             ov_info = f"探测失败: {e}"
 
+    # ---- AI MV / T2V 状态 ----
+    t2v_chain = " → ".join(config.T2V_BACKEND_PRIORITY)
+    api_state = "✅ 已配置" if config.EXT_VIDEO_API_ENABLED else "⚠️ 未配置"
+    llm_state = "✅ 已配置" if config.PROMPT_LLM_ENABLED else "⚠️ 未配置（规则匹配）"
+    qsv_state = "✅ h264_qsv" if config.HAS_QSV else "⚠️ libx264 回退"
+
     return f"""
 <div style="background:#1e1e2e; border-radius:12px; padding:16px 24px; margin-bottom:16px;
             font-family:monospace; line-height:1.8;">
@@ -130,5 +136,15 @@ def get_status_html():
   <span style="color:#cdd6f4;">{dri_info}</span><br>
 <span style="color:#a6adc8;">OpenVINO 设备</span>
   <span style="color:#cdd6f4;">{ov_info}</span><br>
+<span style="color:#a6adc8;">AI MV 后端链</span>
+  <span style="color:#cdd6f4;">{t2v_chain}</span><br>
+<span style="color:#a6adc8;">外部视频API</span>
+  <span style="color:#cdd6f4;">{api_state}</span><br>
+<span style="color:#a6adc8;">LLM 写Prompt</span>
+  <span style="color:#cdd6f4;">{llm_state}</span><br>
+<span style="color:#a6adc8;">QSV 硬编</span>
+  <span style="color:#cdd6f4;">{qsv_state}</span><br>
+<span style="color:#a6adc8;">AI MV 生成模型</span>
+  <span style="color:#cdd6f4;">{config.DEFAULT_AIMV_MODEL}</span><br>
 </div>
 """

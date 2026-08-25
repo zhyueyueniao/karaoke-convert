@@ -1,5 +1,6 @@
 """全局配置、硬件探测、常量"""
 import os
+import json
 import shutil
 import subprocess
 
@@ -111,3 +112,131 @@ TORCH_MARKERS = "/root/.cache/torch/.demucs_markers"  # 所有 Demucs 模型 tor
 
 WHISPER_SIZES = {"tiny": "75MB", "base": "141MB", "small": "464MB", "medium": "1.4GB", "large-v3": "~3.1GB"}
 DEMUCS_SIZES  = {"mdx_extra": "639MB", "mdx_q": "199MB", "htdemucs": "80MB","htdemucs_ft": "321MB", "mdx": "695MB"}
+
+
+# ============================================================
+#  AI MV 生成（根据歌词意境自动生成视频）
+# ============================================================
+
+# OpenVINO 模型缓存根目录（LTX-Video / SD 转换后的 IR + GPU kernel 缓存，挂载到 ./model_cache/openvino）
+OPENVIDEO_MODELS_DIR = "/root/.cache/openvino"
+
+# ---- 三层可插拔视频生成后端降级链 ----
+#  P0 外部视频生成 API（云端，质量最高） → P1 LTX-Video 真文生视频（本地 iGPU）→ P2 SD文生图+FFmpeg运动（本地兜底）
+AVAILABLE_T2V_BACKENDS = ["api", "ltx-video", "sd-motion"]
+T2V_BACKEND_PRIORITY = ["api", "ltx-video", "sd-motion"]
+# 本地 OpenVINO GenAI 推理设备（iGPU 用 GPU，无 Intel GPU 时回退 CPU）
+T2V_DEVICE = os.environ.get("T2V_DEVICE", "GPU")
+
+# ---- 外部视频生成 API（写视频的后端，与写 prompt 的 LLM 是两套独立配置）----
+# provider 支持: openai / kling / jimeng ；留空表示不启用 P0，直接进入本地降级链
+EXT_VIDEO_API_PROVIDER = os.environ.get("EXT_VIDEO_API_PROVIDER", "")
+EXT_VIDEO_API_KEY      = os.environ.get("EXT_VIDEO_API_KEY", "")
+EXT_VIDEO_API_BASE_URL = os.environ.get("EXT_VIDEO_API_BASE_URL", "")
+# P0 仅在同时配置了 provider + key 时可用
+EXT_VIDEO_API_ENABLED = bool(EXT_VIDEO_API_PROVIDER and EXT_VIDEO_API_KEY)
+
+# ---- 写 prompt 的 LLM API（可选；不配置则走规则关键词匹配场景库）----
+PROMPT_LLM_PROVIDER = os.environ.get("PROMPT_LLM_PROVIDER", "")
+PROMPT_LLM_API_KEY  = os.environ.get("PROMPT_LLM_API_KEY", "")
+PROMPT_LLM_BASE_URL = os.environ.get("PROMPT_LLM_BASE_URL", "")
+PROMPT_LLM_MODEL    = os.environ.get("PROMPT_LLM_MODEL", "")
+PROMPT_LLM_ENABLED  = bool(PROMPT_LLM_PROVIDER and PROMPT_LLM_API_KEY)
+
+# ---- 风格预设前缀库（统一所有片段视觉风格，保证连贯性）----
+STYLE_PRESETS = {
+    "cinematic":  "cinematic, dreamy atmosphere, soft pastel colors, film grain, consistent art style, highly detailed",
+    "anime":      "anime style, vibrant colors, clean lines, cel shaded, consistent art style, highly detailed",
+    "watercolor": "watercolor painting, soft brush strokes, paper texture, gentle pastel tones, consistent art style",
+    "cyberpunk":  "cyberpunk, neon lights, futuristic city, high contrast, dark moody atmosphere, consistent art style",
+    "vintage":    "vintage 1980s film, warm faded colors, grainy, nostalgic mood, consistent art style",
+    "ink":        "Chinese ink wash painting, minimalist, black and white, elegant brushwork, consistent art style",
+}
+DEFAULT_STYLE = "cinematic"
+
+# ---- 场景关键词库（无 LLM 时规则匹配：命中关键词 → 画面元素描述）----
+SCENE_KEYWORDS = {
+    "海":   "ocean waves crashing on shore, vast blue horizon, seagulls, golden sunset reflection on water",
+    "海浪": "rolling ocean waves, sea foam, sandy beach, soft breeze",
+    "山":   "majestic green mountains, misty peaks, pine forest, drifting clouds",
+    "雪山": "snow-capped mountains, cold blue tone, clear sky, icy wilderness",
+    "雨":   "rain falling on city streets, wet pavement reflections, neon glow, melancholic mood",
+    "雪":   "falling snow, quiet winter landscape, bare trees, soft white silence",
+    "夜":   "starry night sky, city lights twinkling, moonlight, peaceful darkness",
+    "星":   "starry galaxy, milky way, glowing cosmos, vast silent space",
+    "花":   "blooming flowers field, petals in gentle wind, warm sunlight, soft colors",
+    "森林": "dense green forest, sunbeams through leaves, mossy ground, tranquil",
+    "城市": "bustling modern city, skyscrapers, moving traffic, energetic atmosphere",
+    "火":   "warm campfire flames, sparks rising, cozy night, orange glow",
+    "风":   "wind blowing through tall grass, leaves swirling, open field, freedom",
+    "爱":   "two silhouettes embracing, warm golden light, tender moment, romantic",
+    "孤独": "lone figure walking empty street, long shadows, blue hour, solitude",
+    "梦":   "surreal dreamscape, floating clouds, soft pastel gradient, ethereal light",
+    "哭":   "teardrop on cheek, dim room, soft rain on window, sorrowful mood",
+    "笑":   "bright smiling face, sunny meadow, laughter, warm joyful light",
+    "离别": "train leaving station, waving goodbye, dusk, melancholy",
+    "春":   "spring cherry blossoms, fresh green sprouts, gentle sunlight, renewal",
+    "秋":   "autumn maple leaves falling, golden wheat field, crisp air, nostalgia",
+    "夏":   "summer beach, bright sun, blue ocean, vivid colors, warmth",
+    "冬":   "winter wonderland, frozen lake, bare branches, cold serenity",
+}
+
+# 未命中任何关键词时的兜底画面描述
+SCENE_DEFAULT = "abstract atmospheric landscape, soft flowing light, gentle gradient, emotional mood"
+
+# ---- LTX-Video 模型（需从 HF 源模型转换 IR；官方无现成 OpenVINO IR）----
+LTXVIDEO_REPO = "Lightricks/LTX-Video"
+LTXVIDEO_OV_DIR = os.path.join(OPENVIDEO_MODELS_DIR, "ltx-video-ov")
+
+# ---- SD / SDXL 文生图模型（官方已提供 OpenVINO 转换 IR，开箱即用）----
+SD15_REPO = "OpenVINO/stable-diffusion-v1-5-fp16-ov"
+SD15_OV_DIR = os.path.join(OPENVIDEO_MODELS_DIR, "sd15-ov")
+SDXL_REPO = "OpenVINO/stable-diffusion-xl-base-1.0-fp16-ov"
+SDXL_OV_DIR = os.path.join(OPENVIDEO_MODELS_DIR, "sdxl-ov")
+
+AVAILABLE_SD_MODELS = ["sd15", "sdxl"]
+# 供 UI 模型管理 Tab 选择的生成模型（LTX-Video + SD/SDXL）
+AVAILABLE_AIMV_MODELS = ["ltx-video", "sd15", "sdxl"]
+DEFAULT_AIMV_MODEL = "sd15"
+
+# 各生成模型在 HF 上的 repo（用于 model_manager 下载/转换）
+AIMV_MODEL_REPOS = {
+    "ltx-video": LTXVIDEO_REPO,
+    "sd15": SD15_REPO,
+    "sdxl": SDXL_REPO,
+}
+AIMV_MODEL_OV_DIRS = {
+    "ltx-video": LTXVIDEO_OV_DIR,
+    "sd15": SD15_OV_DIR,
+    "sdxl": SDXL_OV_DIR,
+}
+# 模型大小预估值（用于 UI 展示）
+AIMV_MODEL_SIZES = {
+    "ltx-video": "~6GB（含转换）",
+    "sd15": "1.6GB",
+    "sdxl": "6.9GB",
+}
+
+# ---- 视频生成参数默认值 ----
+AIMV_RESOLUTION = (512, 320)      # LTX-Video 低分辨率片段；SD+运动也沿用
+AIMV_SEG_MIN = 8.0                # 单段最短时长（秒）
+AIMV_SEG_MAX = 15.0               # 单段最长时长（秒）
+AIMV_XFADE = 0.6                  # 段间交叉淡化时长（秒）
+AIMV_LTX_CLIP_SEC = 3.0           # LTX-Video 单次生成片段秒数（后用 FFmpeg 延长到目标时长）
+AIMV_TIMEOUT_PER_CLIP = 1800      # 单段生成超时（秒），LTX-Video 最慢
+
+
+# ---- QSV 硬件编码探测（启动时一次，缓存结果；不可用时 fallback libx264）----
+def detect_qsv() -> bool:
+    """[硬件探测] 检测 FFmpeg 是否带 h264_qsv 编码器"""
+    if not shutil.which("ffmpeg"):
+        return False
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=20)
+        return "h264_qsv" in out.stdout
+    except Exception:
+        return False
+
+HAS_QSV = detect_qsv()
+print(f"🎬 QSV 硬件编码: {'✅ 启用 (h264_qsv)' if HAS_QSV else '⚠️ 不可用，回退 libx264'}")

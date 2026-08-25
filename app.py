@@ -5,20 +5,27 @@ Tab 结构：
   🎵 单独分离 -> 仅分离人声+伴奏
   🎯 歌词生成对齐 -> 无歌词听写 / 有歌词对齐（统一入口）
   🎬 MV转KTV -> 视频提取音频→分离→歌词→ASS字幕→多音轨KTV视频
-  ⚙️ 模型管理 -> 下载/删除/切换模型
+  🎨 AI MV生成 -> 歌词意境自动生成视频（外部API→LTX-Video→SD+运动 降级链）
+  ⚙️ 模型管理 -> 下载/删除/切换模型（含 LTX-Video/SD/SDXL）
 """
 import os
 import gradio as gr
-from config import AVAILABLE_WHISPER, AVAILABLE_DEMUCS, WHISPER_SIZES, DEMUCS_SIZES
+from config import (AVAILABLE_WHISPER, AVAILABLE_DEMUCS, WHISPER_SIZES, DEMUCS_SIZES,
+                    AVAILABLE_AIMV_MODELS, AIMV_MODEL_SIZES, STYLE_PRESETS, DEFAULT_STYLE,
+                    T2V_BACKEND_PRIORITY, EXT_VIDEO_API_ENABLED, PROMPT_LLM_ENABLED,
+                    DEFAULT_AIMV_MODEL)
 import config
 from model_loader import get_status_html, switch_whisper_model
 from model_manager import (is_whisper_cached, is_demucs_cached,
                            get_whisper_cache_size, get_demucs_cache_size,
                            whisper_dl_btn, whisper_redl_btns, whisper_del_btns,
                            demucs_dl_btn, demucs_redl_btns, demucs_del_btns,
-                           switch_demucs_model)
+                           switch_demucs_model,
+                           is_aimv_cached, get_aimv_cache_size,
+                           aimv_dl_btn, aimv_redl_btns, aimv_del_btns, switch_aimv_model)
 from processing import separate_vocals, align_lyrics, one_click_karaoke
 from video_processing import mv_to_ktv, PRESET_CHOICES
+from video_generation import generate_aimv
 
 # API 文档外部端口（容器内 API 跑在 7861，映射到宿主机的端口通过该变量告知前端）
 API_PORT = os.environ.get("API_PORT", "7861")
@@ -143,14 +150,87 @@ with gr.Blocks(
         align_btn.click(fn=align_lyrics, inputs=[align_audio, align_lyrics_input],
                        outputs=[align_lrc_word, align_lrc_line, align_status, align_btn])
 
+    # ==== 🎨 AI MV 生成 ====
+    with gr.Tab("🎨 AI MV 生成"):
+        gr.Markdown(
+            "上传音频（可选歌词）→ 按歌词意境**自动生成视频**（三层降级链保证出片）\n\n"
+            "🔗 **后端链**：外部视频API → LTX-Video（本地iGPU）→ SD+运动（本地兜底）\n\n"
+            "💡 **歌词**：粘贴 LRC（带时间戳，分段更准）或纯歌词文本；留空则按音频名处理\n"
+            "💡 **模型**：生成模型在「⚙️ 模型管理」Tab 下载（LTX-Video / SD / SDXL）"
+        )
+        with gr.Row():
+            with gr.Column():
+                aimv_audio = gr.Audio(label="🎵 音频（必填）", type="filepath",
+                                      sources=["upload", "microphone"], elem_classes="rw-audio")
+                aimv_lyrics = gr.Textbox(
+                    label="📝 歌词（可选）", lines=6,
+                    placeholder="粘贴 LRC 或纯歌词文本；留空则按音频名处理",
+                    elem_classes="mv-lyrics")
+                aimv_backend = gr.Dropdown(
+                    choices=[("自动（优先级链降级）", "auto"),
+                             ("外部视频API 优先", "api"),
+                             ("LTX-Video（本地 iGPU）", "ltx-video"),
+                             ("SD+运动（本地兜底）", "sd-motion")],
+                    value="auto", label="🎬 生成后端", interactive=True)
+                aimv_style = gr.Dropdown(choices=list(STYLE_PRESETS.keys()),
+                                         value=DEFAULT_STYLE, label="🎨 视觉风格", interactive=True)
+                aimv_burn = gr.Checkbox(label="🔤 烧录 KTV 字幕（需提供歌词）", value=False)
+                aimv_btn = gr.Button("🎬 生成 AI MV", variant="primary", interactive=False)
+            with gr.Column():
+                aimv_video = gr.Video(label="🎬 生成结果")
+                aimv_status = gr.Textbox(label="状态", lines=10, interactive=False)
+        aimv_audio.change(fn=lambda f: gr.update(interactive=f is not None),
+                          inputs=[aimv_audio], outputs=[aimv_btn])
+
+        def _get_audio_duration(path):
+            try:
+                p = subprocess.run(["ffprobe", "-v", "error",
+                                    "-show_entries", "format=duration",
+                                    "-of", "default=noprint_wrappers=1:nokey=1", path],
+                                   capture_output=True, text=True, timeout=30)
+                return float(p.stdout.strip() or 0)
+            except Exception:
+                return None
+
+        def _resolve_aimv_priority(preferred):
+            mapping = {
+                "auto": T2V_BACKEND_PRIORITY,
+                "api": ["api", "ltx-video", "sd-motion"],
+                "ltx-video": ["ltx-video", "sd-motion"],
+                "sd-motion": ["sd-motion"],
+            }
+            return mapping.get(preferred, T2V_BACKEND_PRIORITY)
+
+        def _aimv_generate(audio_file, lyrics, preferred, style, burn_sub):
+            """包装 generate_aimv，UI 只需输出视频+状态+按钮"""
+            state: dict = {}
+            song_dur = _get_audio_duration(audio_file) if audio_file else None
+            priority = _resolve_aimv_priority(preferred)
+            video_out = None
+            for msg in generate_aimv(audio_file, lyrics or "", song_dur,
+                                     backend_priority=priority, style=style,
+                                     burn_subtitles=bool(burn_sub), state=state):
+                if state.get("status") == "done":
+                    video_out = state.get("output_path")
+                yield video_out, msg, gr.update(interactive=False)
+            yield (state.get("output_path"),
+                   "✅ AI MV 生成完成" if state.get("status") == "done" else "❌ 生成失败",
+                   gr.update(interactive=True))
+
+        aimv_btn.click(fn=_aimv_generate,
+                       inputs=[aimv_audio, aimv_lyrics, aimv_backend, aimv_style, aimv_burn],
+                       outputs=[aimv_video, aimv_status, aimv_btn])
+
     # ==== ⚙️ 模型管理 ====
     with gr.Tab("⚙️ 模型管理"):
         gr.Markdown("下载/管理模型，仅已下载的模型可切换")
         with gr.Row():
             whisper_dd = gr.Dropdown(AVAILABLE_WHISPER, value=config.WHISPER_MODEL, label="🎙️ Whisper 模型", interactive=True, info="仅已下载的模型可切换")
             demucs_dd = gr.Dropdown(AVAILABLE_DEMUCS, value=config.DEMUCS_MODEL, label="🎵 Demucs 模型", interactive=True, info="仅已下载的模型可切换")
+            aimv_dd = gr.Dropdown(AVAILABLE_AIMV_MODELS, value=config.DEFAULT_AIMV_MODEL, label="🎨 AI MV 生成模型", interactive=True, info="选择本地生成模型（仅已下载可切换）")
         whisper_dd.change(fn=switch_whisper_model, inputs=[whisper_dd], outputs=[whisper_dd])
         demucs_dd.change(fn=switch_demucs_model, inputs=[demucs_dd], outputs=[demucs_dd])
+        aimv_dd.change(fn=switch_aimv_model, inputs=[aimv_dd], outputs=[aimv_dd])
         def _render_model_list(title, models, sizes_map, is_cached_fn, get_size_fn, dl_fn, redl_fn, del_fn):
             """[UI 构建] 每个模型占两行：第1行 名称+大小 | 按钮，第2行 操作状态"""
             gr.Markdown(title)
@@ -182,6 +262,11 @@ with gr.Blocks(
                 _render_model_list("**🎵 Demucs 模型**", AVAILABLE_DEMUCS, DEMUCS_SIZES,
                                    is_demucs_cached, get_demucs_cache_size,
                                    demucs_dl_btn, demucs_redl_btns, demucs_del_btns)
+            with gr.Column():
+                _render_model_list("**🎨 AI MV 生成模型 (LTX-Video / SD / SDXL)**",
+                                   AVAILABLE_AIMV_MODELS, AIMV_MODEL_SIZES,
+                                   is_aimv_cached, get_aimv_cache_size,
+                                   aimv_dl_btn, aimv_redl_btns, aimv_del_btns)
 
     # 自定义底部 API 链接（替换 Gradio 默认的 /view_api 链接）
     gr.HTML(

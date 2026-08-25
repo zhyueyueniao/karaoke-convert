@@ -5,6 +5,7 @@ POST /submit/karaoke   → 一键处理（可选 lyrics 参数启用对齐）
 POST /submit/separate  → 人声分离
 POST /submit/align     → 歌词生成/对齐（无歌词听写，有歌词对齐）
 POST /submit/mv2ktv    → MV转KTV视频
+POST /submit/aimv      → AI MV 生成（歌词意境自动生成视频）
 GET  /status/{job_id}  → 查询任务状态/进度
 GET  /result/{job_id}/{filename} → 下载结果文件
 GET  /jobs             → 列出所有任务
@@ -14,6 +15,7 @@ POST /stream/karaoke   → 一键处理（SSE）
 POST /stream/separate  → 人声分离（SSE）
 POST /stream/align     → 歌词生成/对齐（SSE）
 POST /stream/mv2ktv    → MV转KTV视频（SSE）
+POST /stream/aimv      → AI MV 生成（SSE）
   事件类型: started / progress / done / error
   done 事件含 job_id，可用 /result/{job_id}/{filename} 下载文件
 """
@@ -150,6 +152,26 @@ def _run_mv2ktv_job(job_id: str, video_path: str, lyrics_text: str | None, style
         _error_job(job_id, str(e))
 
 
+def _run_aimv_job(job_id: str, audio_path: str, lyrics_text: str | None,
+                  backend: str, style: str, burn: bool, song_duration: float | None):
+    """AI MV 生成：歌词分段 → Prompt → 三层后端降级 → 拼接 → 调色 → QSV 编码"""
+    from video_generation import generate_aimv, resolve_aimv_priority
+    try:
+        state: dict = {}
+        gen = generate_aimv(audio_path, lyrics_text or "", song_duration,
+                            backend_priority=resolve_aimv_priority(backend),
+                            style=style, burn_subtitles=bool(burn), state=state)
+        for status in gen:
+            _update_job(job_id, progress=status)
+        out = state.get("output_path")
+        if out and os.path.exists(out):
+            _update_job(job_id, status="done", video_path=out)
+        else:
+            _error_job(job_id, "未生成视频文件")
+    except Exception as e:
+        _error_job(job_id, str(e))
+
+
 # ======================== SSE 流式处理 ========================
 # 一次请求全程实时推送进度，断线即任务终止。
 # 内部仍创建 job_id 写入 jobs 字典，断线后可用 /status/{job_id} 查残余状态。
@@ -260,6 +282,29 @@ def _stream_mv2ktv(job_id: str, video_path: str, lyrics_text: str, style_preset:
         yield _sse("error", {"job_id": job_id, "error": str(e)})
 
 
+def _stream_aimv(job_id: str, audio_path: str, lyrics_text: str, backend: str,
+                 style: str, burn: bool, song_duration: float | None):
+    """[SSE] AI MV 生成"""
+    from video_generation import generate_aimv, resolve_aimv_priority
+    yield _sse("started", {"job_id": job_id, "type": "aimv"})
+    result: dict = {}
+    try:
+        state: dict = {}
+        for status in generate_aimv(audio_path, lyrics_text or "", song_duration,
+                                    backend_priority=resolve_aimv_priority(backend),
+                                    style=style, burn_subtitles=bool(burn), state=state):
+            _update_job(job_id, progress=status)
+            yield _sse("progress", {"progress": status})
+        out = state.get("output_path")
+        if out and os.path.exists(out):
+            result["video_path"] = out
+        _update_job(job_id, status="done", **result)
+        yield _sse("done", {"job_id": job_id, **result})
+    except Exception as e:
+        _error_job(job_id, str(e))
+        yield _sse("error", {"job_id": job_id, "error": str(e)})
+
+
 def _save_upload(file: UploadFile) -> str:
     """保存上传的文件到临时目录"""
     suffix = Path(file.filename or "audio").suffix or ".mp3"
@@ -313,6 +358,26 @@ async def submit_mv2ktv(file: UploadFile = File(...),
     """
     path = _save_upload(file)
     return _start_job("mv2ktv", lambda jid: _run_mv2ktv_job(jid, path, lyricsText, stylePreset))
+
+
+@app.post("/submit/aimv", tags=["AI MV生成：歌词意境自动生成视频"])
+async def submit_aimv(file: UploadFile = File(...),
+                      lyricsText: str | None = Form(None),
+                      backend: str = Form("auto"),
+                      style: str = Form("cinematic"),
+                      burnSubtitles: bool = Form(False),
+                      songDuration: float | None = Form(None)):
+    """AI MV 生成：歌词分段 → Prompt → 三层后端降级(外部API→LTX-Video→SD+运动) → 拼接 → 调色 → QSV 编码
+    
+    - lyricsText: LRC 或纯歌词文本，留空则按音频名处理
+    - backend: auto(优先级链) / api / ltx-video / sd-motion
+    - style: 视觉风格（cinematic/anime/watercolor/cyberpunk/vintage/ink）
+    - burnSubtitles: 是否在最终视频烧录 KTV 字幕（需提供歌词）
+    - songDuration: 歌曲总时长（秒），用于精确控制最后一段结束时间
+    """
+    path = _save_upload(file)
+    return _start_job("aimv", lambda jid: _run_aimv_job(
+        jid, path, lyricsText, backend, style, burnSubtitles, songDuration))
 
 
 # ======================== SSE 流式端点 ========================
@@ -384,6 +449,32 @@ def stream_mv2ktv(file: UploadFile = File(...),
     job_id = _create_stream_job("mv2ktv")
     return StreamingResponse(
         _stream_mv2ktv(job_id, path, lyricsText or "", stylePreset),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
+@app.post("/stream/aimv", tags=["SSE流式：AI MV生成（歌词意境自动生成视频）"])
+def stream_aimv(file: UploadFile = File(...),
+                lyricsText: str | None = Form(None),
+                backend: str = Form("auto"),
+                style: str = Form("cinematic"),
+                burnSubtitles: bool = Form(False),
+                songDuration: float | None = Form(None)):
+    """SSE 流式 AI MV 生成，实时推送进度
+    
+    事件流：
+      event: started  → data: {"job_id":"...","type":"aimv"}
+      event: progress → data: {"progress":"🎥 第 3/12 段 [sd-motion] ..."}
+      event: done     → data: {"job_id":"...","video_path":"..."}
+      event: error     → data: {"job_id":"...","error":"..."}
+    
+    done 后用 GET /result/{job_id}/{filename} 下载结果文件
+    """
+    path = _save_upload(file)
+    job_id = _create_stream_job("aimv")
+    return StreamingResponse(
+        _stream_aimv(job_id, path, lyricsText or "", backend, style, burnSubtitles, songDuration),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )

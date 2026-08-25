@@ -305,52 +305,64 @@ def _run_render_ktv(video_file, ass_path, original_audio, accomp_audio, output_p
         if total_duration <= 0:
             total_duration = 1.0
 
-        cmd = [
-            "ffmpeg", "-y",
+        # 共享参数（输入/映射/字幕/音轨）
+        base_args = [
             "-i", video_file,          # 0: 视频+原始音频
             "-i", accomp_audio,         # 1: 纯伴奏
             "-map", "0:v",              # 视频流
             "-map", "0:a",              # 音轨1: 原始音频(原唱)
             "-map", "1:a",              # 音轨2: 伴奏
             "-vf", f"subtitles='{ass_path}'",
-            "-c:v", "libx264", "-crf", "20", "-preset", "medium",
             "-c:a", "aac", "-b:a", "192k",
             "-metadata:s:a:0", "title=原唱",
             "-metadata:s:a:0", "language=chi",
             "-metadata:s:a:1", "title=伴奏",
             "-metadata:s:a:1", "language=chi",
             "-progress", "pipe:1", "-nostats",
-            output_path
         ]
+        # 视频编码器候选：优先 h264_qsv 硬编，失败回退 libx264
+        enc_candidates = []
+        if getattr(config, "HAS_QSV", False):
+            enc_candidates.append(("h264_qsv", ["-c:v", "h264_qsv", "-preset", "medium", "-pix_fmt", "nv12"]))
+        enc_candidates.append(("libx264", ["-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p"]))
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, bufsize=1)
-        last_pct = -1
-        for line in proc.stdout:
-            line = line.strip()
-            if line.startswith("out_time_ms="):
-                try:
-                    out_ms = int(line.split("=")[1])
-                    pct = int(out_ms / (total_duration * 1000) * 100)
-                    pct = min(99, max(0, pct))
-                    if pct != last_pct and pct % 2 == 0:
-                        last_pct = pct
-                        yield f"⏱️ {_fmt_elapsed(start)} | 🎬 渲染中... {pct}%"
-                except (ValueError, ZeroDivisionError):
-                    pass
-            elif line.startswith("progress=end"):
-                break
+        last_err = ""
+        for enc_name, enc_args in enc_candidates:
+            cmd = ["ffmpeg", "-y"] + base_args + enc_args + [output_path]
+            if enc_name == "h264_qsv":
+                yield f"⏱️ {_fmt_elapsed(start)} | 🎬 使用 QSV 硬件编码渲染..."
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, bufsize=1)
+            last_pct = -1
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_ms="):
+                    try:
+                        out_ms = int(line.split("=")[1])
+                        pct = int(out_ms / (total_duration * 1000) * 100)
+                        pct = min(99, max(0, pct))
+                        if pct != last_pct and pct % 2 == 0:
+                            last_pct = pct
+                            yield f"⏱️ {_fmt_elapsed(start)} | 🎬 渲染中... {pct}%"
+                    except (ValueError, ZeroDivisionError):
+                        pass
+                elif line.startswith("progress=end"):
+                    break
+            proc.wait(timeout=3600)
+            if proc.returncode != 0:
+                last_err = proc.stderr.read()[-500:] if proc.stderr else ""
+                # 尝试下一个编码器回退
+                if enc_name == "h264_qsv":
+                    yield f"⏱️ {_fmt_elapsed(start)} | ⚠️ QSV 编码失败，回退 libx264: {last_err}"
+                continue
+            # 成功
+            break
 
-        proc.wait(timeout=3600)
-        if proc.returncode != 0:
-            stderr_tail = proc.stderr.read()[-500:] if proc.stderr else ""
-            yield f"⏱️ {_fmt_elapsed(start)} | ❌ 渲染失败: {stderr_tail}"
+        if not os.path.exists(output_path):
+            yield f"⏱️ {_fmt_elapsed(start)} | ❌ 渲染失败: {last_err}"
             return
 
-        if os.path.exists(output_path):
-            yield f"⏱️ {_fmt_elapsed(start)} | ✅ KTV视频渲染完成: {output_path}"
-        else:
-            yield f"⏱️ {_fmt_elapsed(start)} | ❌ 输出文件未生成"
+        yield f"⏱️ {_fmt_elapsed(start)} | ✅ KTV视频渲染完成: {output_path}"
     except subprocess.TimeoutExpired:
         yield f"⏱️ {_fmt_elapsed(start)} | ❌ 渲染超时（超过1小时）"
     except Exception as e:

@@ -35,8 +35,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir \
     "demucs>=4.0,<5.0" \
     "diffq" \
-    "onnxruntime-openvino>=1.18,<2.0" \
-    "openvino~=2025.4" \
+    "onnxruntime-openvino>=1.24,<2.0" \
+    "openvino==2026.2.*" \
+    "openvino-genai==2026.2.*" \
+    "openvino-tokenizers==2026.2.*" \
+    "optimum-intel>=2.0" \
     "faster-whisper>=1.0,<2.0" \
     "ctranslate2>=4.0,<5.0" \
     "stable-ts>=2.18.0" \
@@ -48,7 +51,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # ==================== Layer 4: 应用代码 ====================
 # app.py 等通过 volume 热挂载，这一层只有文件拷贝，瞬间完成
 WORKDIR /app
-COPY app.py api.py config.py model_loader.py processing.py model_manager.py /app/
+COPY app.py api.py config.py model_loader.py processing.py model_manager.py video_processing.py video_generation.py /app/
 RUN mkdir -p /app/output /app/workspace
 
 EXPOSE 7860

@@ -16,6 +16,8 @@ services:
       - ./model_cache/huggingface:/root/.cache/huggingface
       # Torch Hub 模型缓存（Demucs 模型文件）
       - ./model_cache/torch:/root/.cache/torch
+      # OpenVINO 模型缓存（LTX-Video / SD 转换后的 IR + GPU kernel 缓存）
+      - ./model_cache/openvino:/root/.cache/openvino
       # 处理输出持久化（重启不丢结果）
       #- ./output:/app/output
       # 宿主机与容器交换文件的共享目录
