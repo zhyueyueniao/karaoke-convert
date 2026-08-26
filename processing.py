@@ -148,11 +148,18 @@ def _run_transcribe(audio_file):
     start = time.time()
     yield None, None, f"📝 开始歌词听写（模型: {config.WHISPER_MODEL}）..."
     # 等待模型就绪（首次需下载 ~1.5GB）
+    model_ok = False
     for ready, msg in model_loader.wait_model_ready():
         if not ready:
             yield None, None, f"⏱️ {_fmt_elapsed(start)} | {msg}"
         else:
+            model_ok = True
             break
+    if not model_ok:
+        # 模型加载失败：必须在此中止，否则会落到 model_loader.model.transcribe() 上 None 模型，
+        # 抛出 'NoneType' object has no attribute 'transcribe' 掩盖真实原因。
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ Whisper 模型加载失败，终止听写（详见 karaoke-convert 服务端日志）"
+        return
     try:
         base_name = os.path.splitext(os.path.basename(audio_file))[0]
         lrc_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_transcribe.lrc")
@@ -233,10 +240,18 @@ def align_lyrics(audio_file, lyrics_text):
         return
     # 有歌词 → 对齐模式
     start = time.time()
+    model_ok = False
     for ready, msg in model_loader.wait_model_ready():
         yield None, None, f"⏱️ {_fmt_elapsed(start)} | {msg}", gr.update(interactive=not ready)
         if ready:
+            model_ok = True
             break
+    if not model_ok:
+        # 模型加载失败（wait_model_ready 仅在失败时以 ready=False 结束）：
+        # 必须在此中止，否则会落到 model_loader.model.align() 上 None 模型，
+        # 抛出 'NoneType' object has no attribute 'align' 掩盖真实原因。
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ Whisper 模型加载失败，终止对齐（详见 karaoke-convert 服务端日志）", gr.update(interactive=True)
+        return
     try:
         base_name = os.path.splitext(os.path.basename(audio_file))[0]
         lrc_word_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_aligned_word.lrc")

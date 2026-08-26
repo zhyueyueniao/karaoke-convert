@@ -16,20 +16,31 @@ _model_load_start_time: float = 0.0  # 加载开始时间戳
 
 
 def _load_model():
-    """[后台线程] 下载并加载 Whisper 模型，完成后设置 model_ready 事件"""
+    """[后台线程] 下载并加载 Whisper 模型，完成后设置 model_ready 事件。
+
+    对 hf-mirror 等不稳定镜像的瞬时断开（'Server disconnected without sending a response.'）
+    做有限重试（3 次，间隔 5s 退避），避免一次性网络失败直接降级为 NoneType 崩溃。
+    """
     global model, model_error, _model_load_start_time
     _model_load_start_time = time.time()
-    try:
-        print(f"🔄 [后台] 正在加载 Whisper {config.WHISPER_MODEL} ({config.WHISPER_DEVICE})...")
-        kwargs = {"device": config.WHISPER_DEVICE}
-        if config.WHISPER_COMPUTE:
-            kwargs["compute_type"] = config.WHISPER_COMPUTE
-        model = stable_whisper.load_faster_whisper(config.WHISPER_MODEL, **kwargs)
-        model_ready.set()
-        print("✅ [后台] 模型加载完成")
-    except Exception as e:
-        model_error = str(e)
-        print(f"❌ [后台] 模型加载失败: {e}")
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            print(f"🔄 [后台] 正在加载 Whisper {config.WHISPER_MODEL} ({config.WHISPER_DEVICE})... (尝试 {attempt}/3)")
+            kwargs = {"device": config.WHISPER_DEVICE}
+            if config.WHISPER_COMPUTE:
+                kwargs["compute_type"] = config.WHISPER_COMPUTE
+            model = stable_whisper.load_faster_whisper(config.WHISPER_MODEL, **kwargs)
+            model_ready.set()
+            print("✅ [后台] 模型加载完成")
+            return
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ [后台] 模型加载失败（尝试 {attempt}/3）: {e}")
+            if attempt < 3:
+                time.sleep(5)
+    model_error = str(last_err)
+    print(f"❌ [后台] 模型加载失败: {last_err}")
 
 
 def ensure_model_ready():
