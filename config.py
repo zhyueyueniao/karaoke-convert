@@ -107,6 +107,13 @@ AVAILABLE_WHISPER = ["tiny", "base", "small", "medium", "large-v3"]
 AVAILABLE_DEMUCS  = ["mdx_extra", "mdx_q", "htdemucs", "htdemucs_ft", "mdx"]
 
 HF_CACHE = "/root/.cache/huggingface"
+# 统一 HuggingFace 缓存目录：huggingface_hub 默认按 HF_HOME/HF_HUB_CACHE 环境变量决定
+# 缓存位置（hub>=1.0 时默认是 $HF_HOME/hub，而非 HF_HOME 本身），而 model_manager 下载时
+# 显式使用 HF_CACHE。二者不一致会导致“模型管理 tab 显示已下载，但处理接口却报模型不存在
+# /一直 等待 Whisper 下载”。这里强制 HF_HOME 与 HF_HUB_CACHE 都指向 HF_CACHE，
+# 使模型加载与下载（含兜底下载）走同一个目录。
+os.environ["HF_HOME"] = HF_CACHE
+os.environ["HF_HUB_CACHE"] = HF_CACHE
 HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://hf-mirror.com")
 TORCH_CHECKPOINTS = "/root/.cache/torch/hub/checkpoints"  # 所有 Demucs 模型 torch hub 缓存目录
 TORCH_MARKERS = "/root/.cache/torch/.demucs_markers"  # 所有 Demucs 模型 torch hub 缓存标记文件

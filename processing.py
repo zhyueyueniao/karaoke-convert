@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import gradio as gr
 import config
@@ -24,6 +25,39 @@ def _fmt_elapsed(start: float) -> str:
     """[格式化] 将耗时秒数转为 MM:SS 格式"""
     elapsed = int(time.time() - start)
     return f"{elapsed // 60:02d}:{elapsed % 60:02d}"
+
+
+def _heartbeat_blocking(worker, start, interval=1.5, pct_start=15, pct_step=4, pct_cap=85):
+    """[工具] 后台线程执行阻塞式 worker()，期间持续产出心跳进度。
+
+    stable-ts 的 transcribe/align 是阻塞调用且不提供进度回调；ctranslate2
+    推理会释放 GIL，因此把重活丢到后台线程，主生成器每 interval 秒 sleep 一次
+    并 yield 递增的心跳百分比，让 SSE 客户端在长任务期间也能看到“还在跑”的进度。
+
+    生成器 yield:
+      (pct, "MM:SS")  —— 任务进行中的心跳（pct 从 pct_start 递增至 pct_cap）
+      (None, result) —— 任务完成（result 为 worker() 返回值；worker 抛异常则向上抛出）
+    """
+    holder: dict = {}
+
+    def _run():
+        try:
+            holder["result"] = worker()
+        except BaseException as e:  # noqa: BLE001 - 透传原异常给调用方
+            holder["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True, name="whisper-progress")
+    t.start()
+    beats = 0
+    while t.is_alive():
+        time.sleep(interval)
+        beats += 1
+        pct = min(pct_start + beats * pct_step, pct_cap)
+        el = int(time.time() - start)
+        yield pct, f"{el // 60:02d}:{el % 60:02d}"
+    if "error" in holder:
+        raise holder["error"]
+    yield None, holder.get("result")
 
 
 def _find_demucs_outputs(base_name: str) -> tuple[str | None, str | None]:
@@ -166,11 +200,21 @@ def _run_transcribe(audio_file):
         lrc_line_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_transcribe_line.lrc")
         srt_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_transcribe.srt")
 
-        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 📝 正在加载音频..."
-        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 📝 正在进行语音识别..."
-        result = model_loader.model.transcribe(audio_file, word_timestamps=True, vad_filter=True)
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 📝 正在加载音频... 10%"
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 📝 正在进行语音识别... 15%"
+        # transcribe 是阻塞调用且无进度回调：后台线程执行，主流程每 1.5s 心跳一次
+        result = None
+        for hb_pct, hb_el in _heartbeat_blocking(
+                lambda: model_loader.model.transcribe(audio_file, word_timestamps=True, vad_filter=True),
+                start):
+            if hb_pct is not None:
+                yield None, None, f"⏱️ {hb_el} | 🔊 语音识别中... {hb_pct}%"
+            else:
+                result = hb_el
+        if result is None:
+            raise RuntimeError("Whisper 听写未返回结果")
 
-        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 📝 正在生成 LRC 歌词..."
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 📝 正在生成 LRC 歌词... 90%"
         try:
             lrc_word_lines, lrc_line_lines, srt_lines = [], [], []
             for i, seg in enumerate(result.segments, 1):
@@ -213,7 +257,7 @@ def _run_transcribe(audio_file):
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
         yield (lrc_content, lrc_line_content,
-               f"⏱️ {_fmt_elapsed(start)} | ✅ 听写完成: {lrc_path} / {lrc_line_path}")
+               f"⏱️ {_fmt_elapsed(start)} | ✅ 听写完成 100%: {lrc_path} / {lrc_line_path}")
     except Exception as e:
         yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 听写异常: {str(e)}"
 
@@ -262,9 +306,32 @@ def align_lyrics(audio_file, lyrics_text):
             yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 歌词内容为空", gr.update(interactive=True)
             return
         print(f"🎯 对齐中（{len(clean_lines)} 句）: {audio_file}")
-        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🎯 对齐 {len(clean_lines)} 句...", gr.update(interactive=False)
-        result = model_loader.model.align(audio_file, clean_text, language=config.WHISPER_LANGUAGE, word_timestamps=True)
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🎯 对齐 {len(clean_lines)} 句... 10%", gr.update(interactive=False)
+        # stable-ts / faster-whisper 不同版本对 align() 的签名不同：部分版本不接受
+        # word_timestamps，直接传会抛 “got unexpected keyword argument(s): word_timestamps”。
+        # 这里按运行时签名条件化传参取最大兼容；word 时间戳本就是对齐的默认产物，
+        # 缺失该形参也不影响逐词结果。
+        import inspect
+        align_fn = model_loader.model.align
+        try:
+            align_params = inspect.signature(align_fn).parameters
+        except (ValueError, TypeError):
+            align_params = {}
+        align_kwargs = {"language": config.WHISPER_LANGUAGE}
+        if "word_timestamps" in align_params:
+            align_kwargs["word_timestamps"] = True
+        # align 是阻塞调用且无进度回调：后台线程执行，主流程每 1.5s 心跳一次，
+        # 长任务期间 SSE 客户端也能持续看到“🔤 正在对齐… NN%”的实时进度。
+        result = None
+        for hb_pct, hb_el in _heartbeat_blocking(lambda: align_fn(audio_file, clean_text, **align_kwargs), start):
+            if hb_pct is not None:
+                yield None, None, f"⏱️ {hb_el} | 🔤 正在对齐（{len(clean_lines)} 句）... {hb_pct}%", gr.update(interactive=False)
+            else:
+                result = hb_el
+        if result is None:
+            raise RuntimeError("Whisper 对齐未返回结果")
         # 逐词 LRC
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | ✍️ 正在生成 LRC... 90%", gr.update(interactive=False)
         lrc_word_lines = []
         for seg in result.segments:
             text = seg.text.strip()
@@ -283,11 +350,20 @@ def align_lyrics(audio_file, lyrics_text):
         lrc_word = "\n".join(lrc_word_lines)
         with open(lrc_word_path, "w", encoding="utf-8") as f:
             f.write(lrc_word)
-        # 行级 LRC
-        lrc_line = result.to_lrc()
-        with open(lrc_line_path, "w", encoding="utf-8") as f:
-            f.write(lrc_line)
-        yield lrc_word, lrc_line, f"⏱️ {_fmt_elapsed(start)} | ✅ 对齐完成: {lrc_line_path}", gr.update(interactive=True)
+        # 行级 LRC（优先用模型自带 to_lrc()，无该方法则手动拼装，兼容 faster-whisper 原生 AlignmentResult）
+        try:
+            lrc_line = result.to_lrc()
+        except AttributeError:
+            lrc_line_lines = []
+            for seg in result.segments:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                st = seg.start
+                ts = f"[{int(st)//60:02d}:{int(st)%60:02d}.{int((st%1)*100):02d}]"
+                lrc_line_lines.append(f"{ts}{text}")
+            lrc_line = "\n".join(lrc_line_lines)
+        yield lrc_word, lrc_line, f"⏱️ {_fmt_elapsed(start)} | ✅ 对齐完成 100%: {lrc_line_path}", gr.update(interactive=True)
     except Exception as e:
         yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 对齐异常: {str(e)}", gr.update(interactive=True)
 

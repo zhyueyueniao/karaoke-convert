@@ -15,6 +15,36 @@ _model_load_started = False       # 是否已触发后台加载
 _model_load_start_time: float = 0.0  # 加载开始时间戳
 
 
+def _resolve_cached_whisper_dir(model_name: str) -> str | None:
+    """在 config.HF_CACHE（模型管理 tab 的下载位置）下定位已下载的 faster-whisper 模型目录。
+
+    返回 snapshots/<rev> 本地路径，供 load_faster_whisper 直接加载——完全绕开
+    huggingface_hub 的缓存解析（其默认缓存目录 HF_HUB_CACHE 在 hub>=1.0 时为
+    $HF_HOME/hub，与 HF_CACHE 不一致时会找不到已下模型、触发重复下载，表现为
+    “模型管理 tab 显示已下载，但处理时一直 等待 Whisper 下载”）。
+    未找到含权重文件的完整模型目录则返回 None（由加载器走首次下载）。
+    """
+    base = os.path.join(config.HF_CACHE, "models--Systran--faster-whisper-" + model_name.replace(".", "--"))
+    snapshots = os.path.join(base, "snapshots")
+    try:
+        if not os.path.isdir(snapshots):
+            return None
+        revs = [d for d in os.listdir(snapshots) if os.path.isdir(os.path.join(snapshots, d))]
+    except OSError:
+        return None
+    # 取最新的有效 revision：须同时含 config.json 与权重文件（model.bin / model.ct2），
+    # 避免残缺缓存（只有 refs 而无完整 blobs）被当成可用模型。
+    for rev in sorted(revs, reverse=True):
+        d = os.path.join(snapshots, rev)
+        try:
+            files = set(os.listdir(d))
+        except OSError:
+            continue
+        if "config.json" in files and any(f in files for f in ("model.bin", "model.ct2")):
+            return d
+    return None
+
+
 def _load_model():
     """[后台线程] 下载并加载 Whisper 模型，完成后设置 model_ready 事件。
 
@@ -30,7 +60,23 @@ def _load_model():
             kwargs = {"device": config.WHISPER_DEVICE}
             if config.WHISPER_COMPUTE:
                 kwargs["compute_type"] = config.WHISPER_COMPUTE
-            model = stable_whisper.load_faster_whisper(config.WHISPER_MODEL, **kwargs)
+            # 优先直接加载 model_manager 已下载到 config.HF_CACHE 的本地模型目录，
+            # 完全绕开 huggingface_hub 的缓存解析（默认缓存目录与 HF_CACHE 不一致
+            # 时会重复下载，表现为“已下载却一直 等待 Whisper 下载”）。
+            local_model = _resolve_cached_whisper_dir(config.WHISPER_MODEL)
+            if local_model:
+                print(f"✅ [后台] 命中本地缓存，直接加载: {local_model}")
+                model = stable_whisper.load_faster_whisper(local_model, **kwargs)
+            else:
+                print(f"⬇️ [后台] 未命中本地缓存，按模型名解析/下载 {config.WHISPER_MODEL}")
+                # 按函数签名条件化传参，避免旧版本无 cache_directory 形参时报 unexpected kwarg。
+                import inspect
+                try:
+                    if "cache_directory" in inspect.signature(stable_whisper.load_faster_whisper).parameters:
+                        kwargs["cache_directory"] = config.HF_CACHE
+                except (ValueError, TypeError):
+                    pass
+                model = stable_whisper.load_faster_whisper(config.WHISPER_MODEL, **kwargs)
             model_ready.set()
             print("✅ [后台] 模型加载完成")
             return
