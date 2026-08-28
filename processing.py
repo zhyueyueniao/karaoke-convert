@@ -222,19 +222,22 @@ def _run_transcribe(audio_file):
                 if not text:
                     continue
                 st, et = seg.start, seg.end
-                ts_head = f"[{int(st)//60:02d}:{int(st)%60:02d}.{int((st%1)*100):02d}]"
+                line_start = _fmt_lrc_ts(st)
                 # 行级 LRC（卡拉OK 整行切换）
-                lrc_line_lines.append(f"{ts_head}{text}")
+                lrc_line_lines.append(f"[{line_start}]{text}")
                 # 逐词 LRC（卡拉OK 逐词变色）
                 words = getattr(seg, "words", None)
                 if words and len(words) > 1:
-                    parts = [ts_head]
+                    parts = [f"[{line_start}]"]
                     for w in words:
-                        wt = w.start
-                        parts.append(f"<{int(wt)//60:02d}:{int(wt)%60:02d}.{int((wt%1)*100):02d}>{w.word.strip()}")
+                        wtext = _clean_word_text(getattr(w, "word", ""))
+                        if not wtext:
+                            continue
+                        wt = w.start if w.start is not None else st
+                        parts.append(f"<{_fmt_lrc_ts(wt)}>{wtext}")
                     lrc_word_lines.append("".join(parts))
                 else:
-                    lrc_word_lines.append(f"{ts_head}{text}")
+                    lrc_word_lines.append(f"[{line_start}]{text}")
                 # SRT 字幕
                 srt_lines.append(str(i))
                 srt_lines.append(f"{int(st//3600):02d}:{int((st%3600)//60):02d}:{int(st%60):02d},{int((st%1)*1000):03d}"
@@ -263,6 +266,51 @@ def _run_transcribe(audio_file):
 
 
 # ---- 歌词生成/对齐（统一入口） ----
+
+# 确定性时间标记正则：行级 [..] 与词级 <..>（含全角，抗畸形输入）
+import re as _re
+_LRC_TIMING_RE = _re.compile(r"\[[^\]]*\]|<[^>]*>")
+_FULLWIDTH_BRACKET_RE = _re.compile(r"［[^］]*］|＜[^＞]*＞")
+
+
+def _fmt_lrc_ts(sec: float) -> str:
+    """秒 → mm:ss.xxx（3 位毫秒，确定性）。.NET 端 WordMarkRegex / LrcLineRegex
+    均兼容 2 或 3 位毫秒，3 位更精确，用于卡拉OK 逐词变色。"""
+    sec = max(0.0, float(sec))
+    mm = int(sec // 60)
+    ss = int(sec % 60)
+    ms = int(round((sec - int(sec)) * 1000))
+    if ms >= 1000:
+        ms -= 1000
+        ss += 1
+    if ss >= 60:
+        ss -= 60
+        mm += 1
+    return f"{mm:02d}:{ss:02d}.{ms:03d}"
+
+
+# 时间戳残片判定：全部由数字/时间符号构成、且带分隔符或括号特征（如 "9]"、"[02:"、"10."）。
+# 纯数字（歌词 "520"/"1314"）不判残片，避免误杀真实歌词。
+_TIMING_DEBRIS_CHARS = _re.compile(r"[\d\s.:,<>\[\]()（）\-]+")
+_TIMING_DEBRIS_MARK = _re.compile(r"[<>{}\[\]()（）:.]")
+
+
+def _clean_word_text(raw) -> str:
+    """清洗 Whisper 单词文本：剥离被混入的时间标记（[..] / <..> / 全角），
+    并丢弃时间戳残片（完整标记被模型拆碎后的不成对片段，如 "9]"、"[02:"、"10."），
+    仅保留真实歌词字符。对齐退化时 Whisper 偶会把结束时间戳当成一个“词”，
+    若不清洗会被 <词级> 标记包裹成 [00:<..>19.<..>29<..>8] 畸形串烧进字幕。"""
+    if not raw:
+        return ""
+    s = _LRC_TIMING_RE.sub("", str(raw))
+    s = _FULLWIDTH_BRACKET_RE.sub("", s)
+    s = s.strip()
+    if not s:
+        return ""
+    if not s.isdigit() and _TIMING_DEBRIS_CHARS.fullmatch(s) and _TIMING_DEBRIS_MARK.search(s):
+        return ""  # 时间戳残片：成对括号被拆碎后的片段，丢弃
+    return s
+
 
 def align_lyrics(audio_file, lyrics_text):
     """[歌词生成/对齐] 统一入口：
@@ -300,7 +348,16 @@ def align_lyrics(audio_file, lyrics_text):
         base_name = os.path.splitext(os.path.basename(audio_file))[0]
         lrc_word_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_aligned_word.lrc")
         lrc_line_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_aligned.lrc")
-        clean_lines = [l.strip() for l in lyrics_text.strip().split("\n") if l.strip()]
+        # 清除输入歌词中的旧时间戳标记（行级 [mm:ss.xx] / 词级 <mm:ss.xxx> / 全角变体，
+        # 以及 [ti:..] 等元数据标签），否则时间戳字符会被 CTC 对齐当成"歌词词"逐个贴上
+        # 新时间戳，输出形如 <02:07.420>9] 的残片污染逐词 LRC。
+        clean_lines = []
+        for l in lyrics_text.strip().split("\n"):
+            l = _LRC_TIMING_RE.sub("", l)
+            l = _FULLWIDTH_BRACKET_RE.sub("", l)
+            l = l.strip()
+            if l:
+                clean_lines.append(l)
         clean_text = "\n".join(clean_lines)
         if not clean_text:
             yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 歌词内容为空", gr.update(interactive=True)
@@ -335,18 +392,21 @@ def align_lyrics(audio_file, lyrics_text):
         lrc_word_lines = []
         for seg in result.segments:
             text = seg.text.strip()
-            if not text: continue
-            st = seg.start
-            ts = f"[{int(st)//60:02d}:{int(st)%60:02d}.{int((st%1)*100):02d}]"
+            if not text:
+                continue
+            line_start = _fmt_lrc_ts(seg.start)
             words = getattr(seg, "words", None)
             if words and len(words) > 1:
-                parts = [ts]
+                parts = [f"[{line_start}]"]
                 for w in words:
-                    wt = w.start
-                    parts.append(f"<{int(wt)//60:02d}:{int(wt)%60:02d}.{int((wt%1)*100):02d}>{w.word.strip()}")
+                    wtext = _clean_word_text(getattr(w, "word", ""))
+                    if not wtext:
+                        continue
+                    wt = w.start if w.start is not None else seg.start
+                    parts.append(f"<{_fmt_lrc_ts(wt)}>{wtext}")
                 lrc_word_lines.append("".join(parts))
             else:
-                lrc_word_lines.append(f"{ts}{text}")
+                lrc_word_lines.append(f"[{line_start}]{text}")
         lrc_word = "\n".join(lrc_word_lines)
         with open(lrc_word_path, "w", encoding="utf-8") as f:
             f.write(lrc_word)
