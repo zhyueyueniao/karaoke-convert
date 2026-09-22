@@ -312,6 +312,55 @@ def _clean_word_text(raw) -> str:
     return s
 
 
+def _words_to_lrc(words, clean_lines):
+    """Qwen3 Aligner 词级时间戳 → (逐词 LRC, 行级 LRC)。
+
+    ForcedAligner 返回词序列的顺序与输入文本一致，故按词长顺序消费"去空白全文"
+    指针即可完成词→行归属；显示文本直接从原歌词切片（而非模型返回的词文本），
+    保证 LRC 内容与输入歌词逐字一致，对齐器只提供时间戳。
+    模型分词与原文存在个别字符出入时指针会渐进偏移，越界词安全丢弃（Pilot 容错）。
+    """
+    nospace = "".join("".join(l.split()) for l in clean_lines)
+    bounds, p = [], 0  # 每行在去空白全文中的结束偏移
+    for l in clean_lines:
+        p += len("".join(l.split()))
+        bounds.append(p)
+    # 词标记: (在去空白全文中的起始位置, 起始秒)
+    word_marks = []
+    gp = 0
+    for text, st, _et in words:
+        wn = "".join(text.split())
+        if not wn:
+            continue
+        word_marks.append((gp, st))
+        gp += len(wn)
+
+    def _line_of(pos: int) -> int:
+        for i, b in enumerate(bounds):
+            if pos < b:
+                return i
+        return len(bounds) - 1
+
+    lrc_word_lines, lrc_line_lines = [], []
+    base = 0
+    for li, line in enumerate(clean_lines):
+        ln = "".join(line.split())
+        if not ln:
+            continue
+        ws = [(pos - base, st) for pos, st in word_marks if base <= pos < base + len(ln)]
+        line_start = _fmt_lrc_ts(ws[0][1]) if ws else _fmt_lrc_ts(0.0)
+        out_line_lines.append(f"[{line_start}]{line.strip()}")
+        parts = [f"[{line_start}]"]
+        for k, (rp, st) in enumerate(ws):
+            nxt = ws[k + 1][0] if k + 1 < len(ws) else len(ln)
+            seg = ln[rp:nxt]
+            if seg:
+                parts.append(f"<{_fmt_lrc_ts(st)}>{seg}")
+        lrc_word_lines.append("".join(parts))
+        base += len(ln)
+    return "\n".join(lrc_word_lines), "\n".join(out_line_lines)
+
+
 def align_lyrics(audio_file, lyrics_text):
     """[歌词生成/对齐] 统一入口：
     - lyrics_text 为空 → 听写生成歌词（Whisper 语音识别）
@@ -362,6 +411,42 @@ def align_lyrics(audio_file, lyrics_text):
         if not clean_text:
             yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 歌词内容为空", gr.update(interactive=True)
             return
+        # ---- qwen3 后端：Qwen3-ForcedAligner 文本↔音频直接对齐 ----
+        # 失败（加载失败/推理异常/音频超限）自动落入下方 stable-ts 逻辑，保证功能不中断
+        if config.ALIGN_BACKEND == "qwen3":
+            try:
+                import qwen_aligner
+                a_ok = False
+                for ready, msg in qwen_aligner.wait_ready():
+                    if not ready:
+                        yield None, None, f"⏱️ {_fmt_elapsed(start)} | {msg}", gr.update(interactive=False)
+                    else:
+                        a_ok = True
+                        break
+                if not a_ok:
+                    raise RuntimeError(qwen_aligner._error or "Qwen3-Aligner 加载失败")
+                yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🎯 Qwen3 对齐 {len(clean_lines)} 句... 15%", gr.update(interactive=False)
+                words = None
+                for hb_pct, hb_el in _heartbeat_blocking(
+                        lambda: qwen_aligner.align_words(audio_file, clean_text), start,
+                        pct_start=15, pct_step=3, pct_cap=90):
+                    if hb_pct is not None:
+                        yield None, None, f"⏱️ {hb_el} | 🎯 Qwen3 对齐中（{len(clean_lines)} 句）... {hb_pct}%", gr.update(interactive=False)
+                    else:
+                        words = hb_el
+                if not words:
+                    raise RuntimeError("Qwen3 对齐未返回词级结果")
+                lrc_word, lrc_line = _words_to_lrc(words, clean_lines)
+                with open(lrc_word_path, "w", encoding="utf-8") as f:
+                    f.write(lrc_word)
+                with open(lrc_line_path, "w", encoding="utf-8") as f:
+                    f.write(lrc_line)
+                yield lrc_word, lrc_line, f"⏱️ {_fmt_elapsed(start)} | ✅ Qwen3 对齐完成 100%: {lrc_line_path}", gr.update(interactive=True)
+                return
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠️ Qwen3 对齐失败，回退 stable-ts: {e}", flush=True)
+                yield None, None, f"⏱️ {_fmt_elapsed(start)} | ⚠️ Qwen3 对齐失败（{str(e)[:80]}），回退 stable-ts...", gr.update(interactive=False)
+            # 注意：此处刻意不 return —— 继续执行下方 stable-ts 对齐
         print(f"🎯 对齐中（{len(clean_lines)} 句）: {audio_file}")
         yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🎯 对齐 {len(clean_lines)} 句... 10%", gr.update(interactive=False)
         # stable-ts / faster-whisper 不同版本对 align() 的签名不同：部分版本不接受

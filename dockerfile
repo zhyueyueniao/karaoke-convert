@@ -41,14 +41,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "ctranslate2>=4.0,<5.0" \
     "stable-ts>=2.18.0" \
     "gradio>=6.0,<7.0" \
-    "fastapi>=0.110" "uvicorn>=0.29" "python-multipart>=0.0.9" && \
+    "fastapi>=0.110" "uvicorn>=0.29" "python-multipart>=0.0.9" \
+    "qwen-asr" && \
     find /app/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; true && \
     find /app/venv -type f -name "*.pyc" -delete 2>/dev/null; true
 
 # ==================== Layer 4: 应用代码 ====================
 # app.py 等通过 volume 热挂载，这一层只有文件拷贝，瞬间完成
 WORKDIR /app
-COPY app.py api.py config.py model_loader.py processing.py model_manager.py /app/
+COPY app.py api.py config.py model_loader.py processing.py model_manager.py qwen_aligner.py /app/
 RUN mkdir -p /app/output /app/workspace
 
 EXPOSE 7860

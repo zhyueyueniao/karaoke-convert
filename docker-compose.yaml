@@ -29,6 +29,12 @@ services:
       # 禁用 Xet/CAS 传输，镜像站不支持
       - HF_HUB_ENABLE_HF_TRANSFER=0
       - HF_HUB_DISABLE_XET=1
+      # ---- 歌词对齐后端（Pilot）----
+      # qwen3: Qwen3-ForcedAligner-0.6B（文本↔音频直接对齐，中文/粤语原生），
+      #        首次对齐时自动下载 ~1.2GB 到 model_cache/huggingface
+      # stable-ts: 原 whisper DTW 对齐（切回默认改回此值）
+      - ALIGN_BACKEND=qwen3
+      #- ALIGNER_MODEL=Qwen/Qwen3-ForcedAligner-0.6B
       #- KARAOKE_API=1 # 启用 karaoke api
     deploy:
       resources:
