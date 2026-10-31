@@ -169,6 +169,13 @@ def get_status_html():
         except Exception as e:
             ov_info = f"探测失败: {e}"
 
+    # 歌词对齐后端（仅"有歌词文本"时使用；无歌词听写恒为 Whisper）
+    if config.ALIGN_BACKEND == "qwen3":
+        align_backend_info = (f"Qwen3-ForcedAligner {config.ALIGNER_MODEL}"
+                              f"（文本↔音频直接对齐，失败自动回退 stable-ts）")
+    else:
+        align_backend_info = "stable-ts（whisper 识别 + DTW）"
+
     return f"""
 <div style="background:#1e1e2e; border-radius:12px; padding:16px 24px; margin-bottom:16px;
             font-family:monospace; line-height:1.8;">
@@ -181,6 +188,8 @@ def get_status_html():
   <span style="color:#cdd6f4;">{whisper_mode}</span><br>
 <span style="color:#a6adc8;">Whisper 模型</span>
   <span style="color:#cdd6f4;">{config.WHISPER_MODEL} (faster-whisper + stable-ts)</span><br>
+<span style="color:#a6adc8;">歌词对齐（有歌词时）</span>
+  <span style="color:#cdd6f4;">{align_backend_info}</span><br>
 <span style="color:#a6adc8;">人声分离模型</span>
   <span style="color:#cdd6f4;">Demucs {config.DEMUCS_MODEL}</span><br>
 <span style="color:#a6adc8;">DRI 节点</span>

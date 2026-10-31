@@ -25,7 +25,9 @@
 上传音频 → 自动生成逐词 LRC 歌词。
 
 - **无歌词**：Whisper 自动听写生成歌词
-- **有歌词**：CTC 强制对齐已有歌词文本（支持纯文本或带旧时间戳的 LRC）
+- **有歌词**：强制对齐已有歌词文本（支持纯文本或带旧时间戳的 LRC），两个对齐后端可选：
+  - `stable-ts`（默认）：Whisper 识别 + DTW 锚定
+  - `qwen3`：**Qwen3-ForcedAligner-0.6B**（阿里 Qwen3-ASR 家族），非自回归专用对齐模型，文本↔音频直接对齐不经识别环节，原生支持中文/粤语；加载/推理失败自动回退 stable-ts
 
 ### 📡 REST API
 
@@ -48,12 +50,13 @@
 
 - **Whisper**：tiny / base / small / medium / large-v3（下载、切换、删除）
 - **Demucs**：mdx_extra / mdx_q / htdemucs / htdemucs_ft / mdx（下载、切换、删除）
+- **对齐模型（阿里 Qwen3）**：Qwen/Qwen3-ForcedAligner-0.6B（下载、删除；`ALIGN_BACKEND=qwen3` 时使用）
 
 ## 技术栈
 
 - **人声分离**：[Demucs](https://github.com/facebookresearch/demucs)（Hybrid Transformer 音源分离）
 - **语音识别/对齐**：[faster-whisper](https://github.com/SYSTRAN/faster-whisper)（Whisper CTranslate2 加速版）
-- **歌词对齐**：[stable-ts](https://github.com/jianfch/stable-ts)（CTC 强制对齐，支持逐词时间戳）
+- **歌词对齐**：[stable-ts](https://github.com/jianfch/stable-ts)（CTC 强制对齐，支持逐词时间戳）；可选 [Qwen3-ForcedAligner](https://github.com/QwenLM/Qwen3-ASR)（阿里 Qwen3-ASR 家族，`ALIGN_BACKEND=qwen3` 启用）
 - **前端 UI**：[Gradio](https://gradio.app/)（>=4.12）
 - **API 服务**：[FastAPI](https://fastapi.tiangolo.com/) + Uvicorn
 - **视频处理**：FFmpeg
@@ -108,6 +111,8 @@ python app.py
 | `HF_ENDPOINT` | `hf-mirror.com` | HuggingFace 镜像（国内加速） |
 | `DEMUCS_MODEL` | `mdx_extra` | 默认 Demucs 模型 |
 | `WHISPER_MODEL` | `medium` | 默认 Whisper 模型 |
+| `ALIGN_BACKEND` | `stable-ts` | 歌词对齐后端：`stable-ts` / `qwen3`（阿里 Qwen3-ForcedAligner，失败自动回退） |
+| `ALIGNER_MODEL` | `Qwen/Qwen3-ForcedAligner-0.6B` | 对齐模型 HF/ModelScope 仓库名或本地目录 |
 
 ## 模型存储
 
@@ -129,6 +134,7 @@ karaoke-convert/
 ├── config.py           # 配置、硬件探测、模型选择
 ├── processing.py       # 人声分离 / 歌词听写 / CTC 对齐 / 一键处理
 ├── video_processing.py # MV 转 KTV 视频处理 / LRC 转 ASS 字幕
+├── qwen_aligner.py     # Qwen3-ForcedAligner 对齐后端（ALIGN_BACKEND=qwen3）
 ├── model_loader.py     # 模型加载 + 切换
 ├── model_manager.py    # 模型下载 / 删除 / 状态
 ├── docker-compose.yaml # Docker 编排

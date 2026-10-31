@@ -16,12 +16,22 @@ from model_manager import (is_whisper_cached, is_demucs_cached,
                            get_whisper_cache_size, get_demucs_cache_size,
                            whisper_dl_btn, whisper_redl_btns, whisper_del_btns,
                            demucs_dl_btn, demucs_redl_btns, demucs_del_btns,
-                           switch_demucs_model)
+                           switch_demucs_model,
+                           is_aligner_cached, get_aligner_cache_size,
+                           aligner_dl_btn, aligner_redl_btns, aligner_del_btns)
 from processing import separate_vocals, align_lyrics, one_click_karaoke
 from video_processing import mv_to_ktv, PRESET_CHOICES
 
 # API 文档外部端口（容器内 API 跑在 7861，映射到宿主机的端口通过该变量告知前端）
 API_PORT = os.environ.get("API_PORT", "7861")
+
+
+def _align_backend_note() -> str:
+    """[文案] 按 config.ALIGN_BACKEND 生成“有歌词对齐”的说明（无歌词听写恒为 Whisper）"""
+    if config.ALIGN_BACKEND == "qwen3":
+        return ("💡 **有歌词**：粘贴歌词文本用 **Qwen3-ForcedAligner**（阿里 Qwen3-ASR 家族）"
+                "文本↔音频直接对齐，原生支持中文/粤语，模型加载/推理失败自动回退 stable-ts")
+    return "💡 **有歌词**：粘贴歌词文本则用 CTC 强制对齐（更精准）"
 
 
 # 自定义 CSS
@@ -62,7 +72,8 @@ with gr.Blocks(
         gr.Markdown(
             "上传MV视频 → 提取音频 → 分离人声伴奏 → 生成逐词歌词 → 烧录卡拉OK字幕 → **多音轨KTV视频**\n\n"
             "💡 **多音轨说明**：输出视频包含两条音轨（音轨1=原唱，音轨2=纯伴奏），播放器可切换\n\n"
-            "💡 **歌词来源**：填写歌词文本则用对齐（更精准），留空则自动听写"
+            "💡 **歌词来源**：填写歌词文本则用对齐（更精准），留空则自动听写\n\n"
+            f"{_align_backend_note()}"
         )
         with gr.Row():
             mv_video = gr.Video(label="上传MV视频", height=320)
@@ -124,7 +135,7 @@ with gr.Blocks(
         gr.Markdown(
             "上传音频 → 自动生成逐词 LRC 歌词\n\n"
             "💡 **无歌词**：自动听写生成歌词（适合没有歌词文本的情况）\n"
-            "💡 **有歌词**：粘贴歌词文本则用 CTC 强制对齐（更精准）"
+            f"{_align_backend_note()}"
         )
         with gr.Row():
             align_audio = gr.Audio(type="filepath", label="上传音频/人声", elem_classes="rw-audio")
@@ -182,6 +193,32 @@ with gr.Blocks(
                 _render_model_list("**🎵 Demucs 模型**", AVAILABLE_DEMUCS, DEMUCS_SIZES,
                                    is_demucs_cached, get_demucs_cache_size,
                                    demucs_dl_btn, demucs_redl_btns, demucs_del_btns)
+            with gr.Column():
+                # ---- 🎯 对齐后端（Qwen3-ForcedAligner，仅一个模型） ----
+                gr.Markdown("**🎯 对齐模型（阿里 Qwen3）**")
+                if config.ALIGN_BACKEND != "qwen3":
+                    gr.Markdown(f"⚠️ 当前 `ALIGN_BACKEND={config.ALIGN_BACKEND}`，对齐走 stable-ts，"
+                                "此模型仅在启用 qwen3 后端时使用")
+                _al_name = config.ALIGNER_MODEL
+                _al_cached = is_aligner_cached(_al_name)
+                _al_state = gr.State(_al_name)
+                with gr.Row(equal_height=True, elem_classes="model-row"):
+                    with gr.Column(scale=0):
+                        _al_size_md = gr.Markdown(f"**{_al_name}**  ({get_aligner_cache_size(_al_name)})")
+                    with gr.Column(scale=0):
+                        with gr.Row():
+                            _al_dl_btn = gr.Button("📥下载", variant="primary", size="sm", visible=not _al_cached, elem_classes="download-btn")
+                            _al_redl_btn = gr.Button("🔄重下", variant="secondary", size="sm", visible=_al_cached)
+                            _al_del_btn = gr.Button("🗑删除", variant="secondary", size="sm", visible=_al_cached, elem_classes="delete-btn")
+                _al_st = gr.Textbox(show_label=False, lines=1, max_lines=1, elem_classes="status-box")
+                if _al_cached:
+                    _al_redl_btn.click(fn=aligner_redl_btns, inputs=[_al_state],
+                                       outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
+                    _al_del_btn.click(fn=aligner_del_btns, inputs=[_al_state],
+                                      outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
+                else:
+                    _al_dl_btn.click(fn=aligner_dl_btn, inputs=[_al_state],
+                                     outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
 
     # 自定义底部 API 链接（替换 Gradio 默认的 /view_api 链接）
     gr.HTML(

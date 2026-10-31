@@ -107,6 +107,16 @@ def wait_ready():
     yield True, None
 
 
+def reset():
+    """[模型管理] 删除缓存后重置运行时状态，下次对齐将重新触发下载/加载"""
+    global _aligner, _error, _load_started, _load_start_time
+    _aligner = None
+    _error = None
+    _load_started = False
+    _load_start_time = 0.0
+    _ready.clear()
+
+
 def _probe_duration(audio_path: str) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
