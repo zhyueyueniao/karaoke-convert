@@ -2,8 +2,8 @@ services:
   ktv-convert:
     image: karaoke-tool-ultra255:latest
     container_name: karaoke-tool-ultra255
-    # 使用 venv 的 python（覆盖镜像 CMD 中可能未正确解析 PATH 的问题）
-    command: /app/venv/bin/python3 /app/app.py
+    # venv 在镜像内 /opt/venv（挂载点 /app 之外，不受 ./app 热更新挂载影响）
+    command: /opt/venv/bin/python3 /app/app.py
     restart: unless-stopped
     network_mode: bridge
     ports:

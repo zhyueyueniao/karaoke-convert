@@ -2,7 +2,7 @@
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV PATH="/app/venv/bin:$PATH"
+ENV PATH="/opt/venv/bin:$PATH"
 ENV HF_HUB_ENABLE_HF_TRANSFER=0
 
 # ==================== Layer 1: 系统依赖 ====================
@@ -30,7 +30,7 @@ RUN mkdir -p /usr/share/keyrings && \
 
 # ==================== Layer 3: Python 依赖（OpenVINO 改用 pip 安装，省去 ~600MB tgz）====================
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m venv /app/venv && \
+    python3 -m venv /opt/venv && \
     pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
     pip install --no-cache-dir \
     "demucs>=4.0,<5.0" \
@@ -43,8 +43,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "gradio>=6.0,<7.0" \
     "fastapi>=0.110" "uvicorn>=0.29" "python-multipart>=0.0.9" \
     "qwen-asr" && \
-    find /app/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; true && \
-    find /app/venv -type f -name "*.pyc" -delete 2>/dev/null; true
+    find /opt/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; true && \
+    find /opt/venv -type f -name "*.pyc" -delete 2>/dev/null; true
 
 # ==================== Layer 4: 应用代码 ====================
 # app.py 等通过 volume 热挂载，这一层只有文件拷贝，瞬间完成
@@ -54,4 +54,4 @@ RUN mkdir -p /app/output /app/workspace
 
 EXPOSE 7860
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/app/venv/bin/python3", "/app/app.py"]
+CMD ["/opt/venv/bin/python3", "/app/app.py"]
