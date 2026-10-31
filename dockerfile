@@ -42,7 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "stable-ts>=2.18.0" \
     "gradio>=6.0,<7.0" \
     "fastapi>=0.110" "uvicorn>=0.29" "python-multipart>=0.0.9" \
-    "qwen-asr" && \
+    "qwen-asr" "sherpa-onnx" && \
     find /opt/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null; true && \
     find /opt/venv -type f -name "*.pyc" -delete 2>/dev/null; true
 

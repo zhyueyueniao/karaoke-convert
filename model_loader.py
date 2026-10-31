@@ -176,6 +176,13 @@ def get_status_html():
     else:
         align_backend_info = "stable-ts（whisper 识别 + DTW）"
 
+    # ASR 语音识别（SenseVoice，独立于歌词管线）
+    from model_manager import is_sensevoice_cached
+    _sv_short = config.SENSEVOICE_MODEL.split("/")[-1]
+    asr_backend_info = (f"SenseVoice {_sv_short}（int8 CPU，已就绪）"
+                        if is_sensevoice_cached(config.SENSEVOICE_MODEL)
+                        else f"SenseVoice {_sv_short}（未下载，请在模型管理下载）")
+
     return f"""
 <div style="background:#1e1e2e; border-radius:12px; padding:16px 24px; margin-bottom:16px;
             font-family:monospace; line-height:1.8;">
@@ -190,6 +197,8 @@ def get_status_html():
   <span style="color:#cdd6f4;">{config.WHISPER_MODEL} (faster-whisper + stable-ts)</span><br>
 <span style="color:#a6adc8;">歌词对齐（有歌词时）</span>
   <span style="color:#cdd6f4;">{align_backend_info}</span><br>
+<span style="color:#a6adc8;">ASR 语音识别</span>
+  <span style="color:#cdd6f4;">{asr_backend_info}</span><br>
 <span style="color:#a6adc8;">人声分离模型</span>
   <span style="color:#cdd6f4;">Demucs {config.DEMUCS_MODEL}</span><br>
 <span style="color:#a6adc8;">DRI 节点</span>

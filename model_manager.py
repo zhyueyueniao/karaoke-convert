@@ -96,6 +96,49 @@ def get_aligner_cache_size(model_name: str) -> str:
     return _format_size(total) if total > 0 else ALIGNER_FALLBACK_SIZE
 
 
+# ---- ASR 语音识别（SenseVoice int8，独立于歌词管线） ----
+SENSEVOICE_FALLBACK_SIZE = "230MB"
+# 只下载 int8 模型与词表，跳过同仓库的 fp32 model.onnx（体积减半）
+SENSEVOICE_ALLOW_PATTERNS = ["model.int8.onnx", "tokens.txt"]
+
+def _sensevoice_cache_dir(model_name: str) -> str:
+    """[路径] HF 仓库名 → 缓存目录"""
+    return os.path.join(HF_CACHE, "models--" + model_name.replace("/", "--"))
+
+def _resolve_sensevoice_snapshot(model_name: str) -> str | None:
+    """[路径] 定位含 model.int8.onnx + tokens.txt 的最新 snapshot"""
+    if os.path.isdir(model_name):
+        return model_name
+    snapshots = os.path.join(_sensevoice_cache_dir(model_name), "snapshots")
+    try:
+        if not os.path.isdir(snapshots):
+            return None
+        revs = sorted((d for d in os.listdir(snapshots) if os.path.isdir(os.path.join(snapshots, d))),
+                      reverse=True)
+    except OSError:
+        return None
+    for rev in revs:
+        d = os.path.join(snapshots, rev)
+        if "model.int8.onnx" in set(os.listdir(d)) and "tokens.txt" in set(os.listdir(d)):
+            return d
+    return None
+
+def is_sensevoice_cached(model_name: str) -> bool:
+    """[检测] SenseVoice 模型是否已下载（本地目录视为始终可用）"""
+    return _resolve_sensevoice_snapshot(model_name) is not None
+
+def get_sensevoice_cache_size(model_name: str) -> str:
+    """[大小] SenseVoice blobs 目录实际磁盘占用，无缓存时返回预估值"""
+    if os.path.isdir(model_name):
+        return "本地目录"
+    blobs = os.path.join(_sensevoice_cache_dir(model_name), "blobs")
+    if not os.path.isdir(blobs):
+        return SENSEVOICE_FALLBACK_SIZE
+    total = sum(os.path.getsize(os.path.join(blobs, f)) for f in os.listdir(blobs)
+                if os.path.isfile(os.path.join(blobs, f)))
+    return _format_size(total) if total > 0 else SENSEVOICE_FALLBACK_SIZE
+
+
 # ---- 删除模型 ----
 
 def delete_whisper_model(model_name: str):
@@ -150,6 +193,28 @@ def delete_aligner_model(model_name: str):
             qwen_aligner.reset()
         except Exception:
             pass  # qwen3 后端未启用时无需重置
+        yield f"✅ {model_name} 已删除"
+    except Exception as e:
+        yield f"❌ 删除失败: {str(e)}"
+
+
+def delete_sensevoice_model(model_name: str):
+    """[删除] 删除 SenseVoice HuggingFace 缓存目录，并重置运行时加载状态"""
+    if os.path.isdir(model_name):
+        yield f"⚠️ {model_name} 为本地目录，不在缓存管理范围"
+        return
+    cache_dir = _sensevoice_cache_dir(model_name)
+    if not os.path.exists(cache_dir):
+        yield f"⚠️ {model_name} 未缓存，无需删除"
+        return
+    yield f"🗑 删除 {model_name}..."
+    try:
+        shutil.rmtree(cache_dir)
+        try:
+            import sensevoice_asr
+            sensevoice_asr.reset()
+        except Exception:
+            pass  # ASR 后端未加载时无需重置
         yield f"✅ {model_name} 已删除"
     except Exception as e:
         yield f"❌ 删除失败: {str(e)}"
@@ -404,6 +469,84 @@ finally:
         yield f"❌ 下载异常: {str(e)}"
 
 
+def download_sensevoice_model(model_name: str, force: bool = False):
+    """[下载] 从 HuggingFace 镜像站下载 SenseVoice int8 模型（仅 int8 + 词表，~230MB）
+
+    - 本地目录模型无需下载
+    - force=False: 已缓存则跳过
+    - force=True: 删除旧缓存后重新下载
+    - 子进程带心跳线程，避免网络空闲时 UI 假死
+    """
+    if os.path.isdir(model_name):
+        yield f"✅ {model_name} 为本地目录，无需下载"
+        return
+    if not force and is_sensevoice_cached(model_name):
+        yield f"✅ {model_name} 已缓存，无需下载"
+        return
+    if force:
+        yield f"🗑 清除旧缓存..."
+        for _ in delete_sensevoice_model(model_name):
+            pass
+    yield f"📥 开始下载 {model_name} (int8)..."
+    start = time.time()
+    try:
+        # 注入子进程代码须带引号，否则 allow_patterns=[model.int8.onnx,...] 是裸标识符会 NameError
+        patterns = ",".join(f'"{p}"' for p in SENSEVOICE_ALLOW_PATTERNS)
+        cmd = """\
+import os, time, threading
+os.environ['HF_ENDPOINT'] = '{hf_endpoint}'
+from huggingface_hub import snapshot_download
+start = time.time()
+stop = threading.Event()
+def heartbeat():
+    while not stop.wait(5):
+        e = int(time.time() - start)
+        msg = '[' + str(e//60).zfill(2) + ':' + str(e%60).zfill(2) + '] downloading...'
+        print(msg, flush=True)
+hb = threading.Thread(target=heartbeat, daemon=True)
+hb.start()
+try:
+    print('connecting...', flush=True)
+    snapshot_download('{repo_id}', cache_dir='{cache_dir}',
+                      allow_patterns=[{patterns}])
+    print('DONE', flush=True)
+finally:
+    stop.set()
+    hb.join(timeout=1)
+""".format(hf_endpoint=HF_ENDPOINT, repo_id=model_name, cache_dir=HF_CACHE, patterns=patterns)
+        proc = subprocess.Popen(["python3", "-u", "-c", cmd], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in proc.stdout:
+            line = line.strip()
+            if not line: continue
+            if "%" in line:
+                m = re.search(r"(\d+)%", line)
+                if m:
+                    eta_m = re.search(r"(\d{1,2}:\d{2})", line)
+                    eta = f" 预计 {eta_m.group(1)}" if eta_m else ""
+                    yield f"⏱️ {_fmt_elapsed(start)} | 📥 下载 {model_name} ... {m.group(1)}%{eta}"
+                else:
+                    yield f"⏱️ {_fmt_elapsed(start)} | 📥 {line}"
+            else:
+                yield f"⏱️ {_fmt_elapsed(start)} | 📥 {line}"
+        proc.wait(timeout=1800)
+        elapsed = time.time() - start
+        if proc.returncode != 0:
+            yield f"⏱️ {_fmt_elapsed(start)} | ❌ 下载失败 (exit={proc.returncode})，请重试"
+            return
+        if not is_sensevoice_cached(model_name):
+            yield f"⏱️ {_fmt_elapsed(start)} | ⚠️ 下载完成但未找到 model.int8.onnx/tokens.txt，请重下"
+            return
+        if elapsed < 10:
+            yield f"⏱️ {_fmt_elapsed(start)} | ✅ {model_name} 模型就绪（缓存命中）"
+        else:
+            yield f"⏱️ {_fmt_elapsed(start)} | ✅ {model_name} 下载完成"
+    except subprocess.TimeoutExpired:
+        yield f"❌ 下载超时（30分钟），请检查网络后重试"
+    except Exception as e:
+        yield f"❌ 下载异常: {str(e)}"
+
+
 def switch_demucs_model(model_name: str) -> str:
     """[运行时切换] 仅允许切换到已下载的 Demucs 模型，立即生效"""
     import config
@@ -485,4 +628,25 @@ def aligner_del_btns(model_name: str):
     for msg in delete_aligner_model(model_name):
         done, ok = _is_done(msg), "✅" in msg
         size_update = gr.update(value=f"**{model_name}**  {ALIGNER_FALLBACK_SIZE}") if ok else gr.update()
+        yield msg, gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=not ok), size_update
+
+def sensevoice_dl_btn(model_name: str):
+    """[📥 下载] SenseVoice 未缓存模型的一键下载"""
+    for msg in download_sensevoice_model(model_name):
+        done, ok = _is_done(msg), "✅" in msg
+        size_update = gr.update(value=f"**{model_name}**  {get_sensevoice_cache_size(model_name)}") if ok else gr.update()
+        yield msg, gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=ok), size_update
+
+def sensevoice_redl_btns(model_name: str):
+    """[🔄 重新下载] SenseVoice 已缓存模型的强制重下"""
+    for msg in download_sensevoice_model(model_name, force=True):
+        done, ok = _is_done(msg), "✅" in msg
+        size_update = gr.update(value=f"**{model_name}**  {get_sensevoice_cache_size(model_name)}") if ok else gr.update()
+        yield msg, gr.update(visible=False), gr.update(interactive=done, visible=True), gr.update(interactive=done, visible=True), size_update
+
+def sensevoice_del_btns(model_name: str):
+    """[🗑 删除] SenseVoice 已缓存模型的删除"""
+    for msg in delete_sensevoice_model(model_name):
+        done, ok = _is_done(msg), "✅" in msg
+        size_update = gr.update(value=f"**{model_name}**  {SENSEVOICE_FALLBACK_SIZE}") if ok else gr.update()
         yield msg, gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=not ok), size_update

@@ -111,6 +111,12 @@ ALIGN_BACKEND = os.environ.get("ALIGN_BACKEND", "stable-ts").strip().lower()
 # Aligner 模型：HF/ModelScope 仓库名或本地目录（from_pretrained 自动下载到 HF_CACHE）
 ALIGNER_MODEL = os.environ.get("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 
+# ---- ASR 语音识别（SenseVoice，独立于歌词生成/对齐管线） ----
+# sherpa-onnx SenseVoice int8（阿里 FunAudioLLM SenseVoice-Small 的 onnx 移植），
+# 非 NAR 自回归架构，CPU int8 极快；仅下载 model.int8.onnx + tokens.txt（~230MB）
+SENSEVOICE_MODEL = os.environ.get(
+    "SENSEVOICE_MODEL", "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+
 AVAILABLE_WHISPER = ["tiny", "base", "small", "medium", "large-v3"]
 AVAILABLE_DEMUCS  = ["mdx_extra", "mdx_q", "htdemucs", "htdemucs_ft", "mdx"]
 

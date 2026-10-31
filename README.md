@@ -20,6 +20,14 @@
 
 上传音频 → 分离人声 + 伴奏（基于 Demucs 模型）。
 
+### 🗣️ ASR 语音识别（SenseVoice）
+
+上传音频 → 纯语音识别，输出文本 + 带时间戳分段（**不生成歌词，独立于歌词管线**）。
+
+- **阿里 SenseVoice-Small**（sherpa-onnx int8，CPU 推理）：非自回归 NAR 架构，速度约为 Whisper 的 5~15 倍
+- 支持中/粤/英/日/韩，带 ITN 标点；token 级时间戳按句末标点聚段
+- API：`POST /submit/asr`（轮询）/ `POST /stream/asr`（SSE，done 含 `text`/`ts_text`）
+
 ### 🎯 歌词生成对齐
 
 上传音频 → 自动生成逐词 LRC 歌词。
@@ -39,23 +47,27 @@
 | 轮询 | `POST /submit/separate` | 人声伴奏分离 |
 | 轮询 | `POST /submit/align` | 歌词生成/对齐（无歌词听写，有歌词对齐） |
 | 轮询 | `POST /submit/mv2ktv` | MV 转 KTV 视频 |
+| 轮询 | `POST /submit/asr` | ASR 语音识别（SenseVoice 纯转写） |
 | 轮询 | `GET /status/{job_id}` | 查询任务状态 |
 | 轮询 | `GET /result/{job_id}/{filename}` | 下载结果文件 |
 | SSE | `POST /stream/karaoke` | 一键处理（实时进度推送） |
 | SSE | `POST /stream/separate` | 人声分离（实时进度推送） |
 | SSE | `POST /stream/align` | 歌词生成/对齐（实时进度推送） |
 | SSE | `POST /stream/mv2ktv` | MV 转 KTV（实时进度推送） |
+| SSE | `POST /stream/asr` | ASR 语音识别（done 含 text/ts_text） |
 
 ### ⚙️ 模型管理
 
 - **Whisper**：tiny / base / small / medium / large-v3（下载、切换、删除）
 - **Demucs**：mdx_extra / mdx_q / htdemucs / htdemucs_ft / mdx（下载、切换、删除）
 - **对齐模型（阿里 Qwen3）**：Qwen/Qwen3-ForcedAligner-0.6B（下载、删除；`ALIGN_BACKEND=qwen3` 时使用）
+- **ASR 识别模型（阿里 SenseVoice）**：csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue（仅下载 int8 模型 + 词表，~230MB）
 
 ## 技术栈
 
 - **人声分离**：[Demucs](https://github.com/facebookresearch/demucs)（Hybrid Transformer 音源分离）
 - **语音识别/对齐**：[faster-whisper](https://github.com/SYSTRAN/faster-whisper)（Whisper CTranslate2 加速版）
+- **独立 ASR 语音识别**：[SenseVoice-Small](https://github.com/FunAudioLLM/SenseVoice)（阿里 FunAudioLLM）+ [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)（int8 CPU 推理）
 - **歌词对齐**：[stable-ts](https://github.com/jianfch/stable-ts)（CTC 强制对齐，支持逐词时间戳）；可选 [Qwen3-ForcedAligner](https://github.com/QwenLM/Qwen3-ASR)（阿里 Qwen3-ASR 家族，`ALIGN_BACKEND=qwen3` 启用）
 - **前端 UI**：[Gradio](https://gradio.app/)（>=4.12）
 - **API 服务**：[FastAPI](https://fastapi.tiangolo.com/) + Uvicorn
@@ -113,6 +125,7 @@ python app.py
 | `WHISPER_MODEL` | `medium` | 默认 Whisper 模型 |
 | `ALIGN_BACKEND` | `stable-ts` | 歌词对齐后端：`stable-ts` / `qwen3`（阿里 Qwen3-ForcedAligner，失败自动回退） |
 | `ALIGNER_MODEL` | `Qwen/Qwen3-ForcedAligner-0.6B` | 对齐模型 HF/ModelScope 仓库名或本地目录 |
+| `SENSEVOICE_MODEL` | `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | ASR 识别模型 HF 仓库名或本地目录 |
 
 ## 模型存储
 
@@ -135,6 +148,7 @@ karaoke-convert/
 ├── processing.py       # 人声分离 / 歌词听写 / CTC 对齐 / 一键处理
 ├── video_processing.py # MV 转 KTV 视频处理 / LRC 转 ASS 字幕
 ├── qwen_aligner.py     # Qwen3-ForcedAligner 对齐后端（ALIGN_BACKEND=qwen3）
+├── sensevoice_asr.py   # SenseVoice 纯 ASR 语音识别（独立于歌词管线）
 ├── model_loader.py     # 模型加载 + 切换
 ├── model_manager.py    # 模型下载 / 删除 / 状态
 ├── docker-compose.yaml # Docker 编排

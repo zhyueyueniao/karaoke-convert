@@ -8,6 +8,7 @@ Tab 结构：
   ⚙️ 模型管理 -> 下载/删除/切换模型
 """
 import os
+import time
 import gradio as gr
 from config import AVAILABLE_WHISPER, AVAILABLE_DEMUCS, WHISPER_SIZES, DEMUCS_SIZES
 import config
@@ -18,7 +19,9 @@ from model_manager import (is_whisper_cached, is_demucs_cached,
                            demucs_dl_btn, demucs_redl_btns, demucs_del_btns,
                            switch_demucs_model,
                            is_aligner_cached, get_aligner_cache_size,
-                           aligner_dl_btn, aligner_redl_btns, aligner_del_btns)
+                           aligner_dl_btn, aligner_redl_btns, aligner_del_btns,
+                           is_sensevoice_cached, get_sensevoice_cache_size,
+                           sensevoice_dl_btn, sensevoice_redl_btns, sensevoice_del_btns)
 from processing import separate_vocals, align_lyrics, one_click_karaoke
 from video_processing import mv_to_ktv, PRESET_CHOICES
 
@@ -32,6 +35,44 @@ def _align_backend_note() -> str:
         return ("💡 **有歌词**：粘贴歌词文本用 **Qwen3-ForcedAligner**（阿里 Qwen3-ASR 家族）"
                 "文本↔音频直接对齐，原生支持中文/粤语，模型加载/推理失败自动回退 stable-ts")
     return "💡 **有歌词**：粘贴歌词文本则用 CTC 强制对齐（更精准）"
+
+
+def _run_asr_ui(audio_file):
+    """[ASR Tab] SenseVoice 语音识别 UI 包装：等待模型 → 听写 → 纯文本 + 带时间戳分段
+
+    纯 ASR 转写功能，不参与歌词生成/对齐管线。
+    """
+    import sensevoice_asr
+    from processing import _heartbeat_blocking, _fmt_elapsed
+    start = time.time()
+    if not audio_file:
+        yield "", "", "❌ 请上传音频文件", gr.update(interactive=True)
+        return
+    yield "", "", f"⏱️ 00:00 | ⚙️ 检查 SenseVoice 模型...", gr.update(interactive=False)
+    ready_ok, last_msg = False, ""
+    for ready, msg in sensevoice_asr.wait_ready():
+        last_msg = msg or ""
+        if ready:
+            ready_ok = True
+            break
+        yield "", "", f"⏱️ {_fmt_elapsed(start)} | {msg}", gr.update(interactive=False)
+    if not ready_ok:
+        yield "", "", last_msg, gr.update(interactive=True)
+        return
+    try:
+        yield "", "", f"⏱️ {_fmt_elapsed(start)} | 🗣️ 语音识别中... 15%", gr.update(interactive=False)
+        text = ts_text = None
+        for hb_pct, hb_val in _heartbeat_blocking(
+                lambda: sensevoice_asr.transcribe(audio_file), start,
+                pct_start=15, pct_step=8, pct_cap=90):
+            if hb_pct is not None:
+                yield "", "", f"⏱️ {hb_val} | 🗣️ 语音识别中... {hb_pct}%", gr.update(interactive=False)
+            else:
+                text, ts_text = hb_val
+        yield text or "", ts_text or "", \
+            f"⏱️ {_fmt_elapsed(start)} | ✅ 识别完成", gr.update(interactive=True)
+    except Exception as e:  # noqa: BLE001
+        yield "", "", f"⏱️ {_fmt_elapsed(start)} | ❌ 识别失败: {e}", gr.update(interactive=True)
 
 
 # 自定义 CSS
@@ -154,6 +195,24 @@ with gr.Blocks(
         align_btn.click(fn=align_lyrics, inputs=[align_audio, align_lyrics_input],
                        outputs=[align_lrc_word, align_lrc_line, align_status, align_btn])
 
+    # ==== 🗣️ ASR 语音识别（SenseVoice，纯转写，独立于歌词管线） ====
+    with gr.Tab("🗣️ ASR 语音识别"):
+        gr.Markdown(
+            "上传音频 → SenseVoice 语音识别，输出文本与带时间戳分段（**纯 ASR 功能，不生成歌词**）\n\n"
+            "💡 **阿里 SenseVoice-Small**（sherpa-onnx int8，CPU 推理）：非自回归架构，"
+            "速度约为 Whisper 的 5~15 倍，支持中/粤/英/日/韩\n"
+            "💡 首次使用请先在 ⚙️ 模型管理 下载 SenseVoice 模型（~230MB）"
+        )
+        asr_audio = gr.Audio(type="filepath", label="上传音频")
+        asr_btn = gr.Button("🗣️ 开始识别", variant="primary", interactive=False)
+        asr_text = gr.Textbox(label="识别文本", lines=8)
+        asr_ts = gr.Textbox(label="带时间戳分段", lines=10)
+        asr_status = gr.Textbox(label="状态", interactive=False)
+        asr_audio.change(fn=lambda a: gr.update(interactive=a is not None),
+                         inputs=[asr_audio], outputs=[asr_btn])
+        asr_btn.click(fn=_run_asr_ui, inputs=[asr_audio],
+                      outputs=[asr_text, asr_ts, asr_status, asr_btn])
+
     # ==== ⚙️ 模型管理 ====
     with gr.Tab("⚙️ 模型管理"):
         gr.Markdown("下载/管理模型，仅已下载的模型可切换")
@@ -219,6 +278,31 @@ with gr.Blocks(
                 else:
                     _al_dl_btn.click(fn=aligner_dl_btn, inputs=[_al_state],
                                      outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
+
+        with gr.Row():
+            with gr.Column():
+                # ---- 🗣️ ASR 识别模型（SenseVoice int8，仅一个模型） ----
+                gr.Markdown("**🗣️ ASR 识别模型（阿里 SenseVoice）**")
+                _sv_name = config.SENSEVOICE_MODEL
+                _sv_cached = is_sensevoice_cached(_sv_name)
+                _sv_state = gr.State(_sv_name)
+                with gr.Row(equal_height=True, elem_classes="model-row"):
+                    with gr.Column(scale=0):
+                        _sv_size_md = gr.Markdown(f"**{_sv_name}**  ({get_sensevoice_cache_size(_sv_name)})")
+                    with gr.Column(scale=0):
+                        with gr.Row():
+                            _sv_dl_btn = gr.Button("📥下载", variant="primary", size="sm", visible=not _sv_cached, elem_classes="download-btn")
+                            _sv_redl_btn = gr.Button("🔄重下", variant="secondary", size="sm", visible=_sv_cached)
+                            _sv_del_btn = gr.Button("🗑删除", variant="secondary", size="sm", visible=_sv_cached, elem_classes="delete-btn")
+                _sv_st = gr.Textbox(show_label=False, lines=1, max_lines=1, elem_classes="status-box")
+                if _sv_cached:
+                    _sv_redl_btn.click(fn=sensevoice_redl_btns, inputs=[_sv_state],
+                                       outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
+                    _sv_del_btn.click(fn=sensevoice_del_btns, inputs=[_sv_state],
+                                      outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
+                else:
+                    _sv_dl_btn.click(fn=sensevoice_dl_btn, inputs=[_sv_state],
+                                     outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
 
     # 自定义底部 API 链接（替换 Gradio 默认的 /view_api 链接）
     gr.HTML(

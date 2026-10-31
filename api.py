@@ -5,6 +5,7 @@ POST /submit/karaoke   → 一键处理（可选 lyrics 参数启用对齐）
 POST /submit/separate  → 人声分离
 POST /submit/align     → 歌词生成/对齐（无歌词听写，有歌词对齐）
 POST /submit/mv2ktv    → MV转KTV视频
+POST /submit/asr       → ASR 语音识别（SenseVoice 纯转写，输出 text/ts_text）
 GET  /status/{job_id}  → 查询任务状态/进度
 GET  /result/{job_id}/{filename} → 下载结果文件
 GET  /jobs             → 列出所有任务
@@ -14,6 +15,7 @@ POST /stream/karaoke   → 一键处理（SSE）
 POST /stream/separate  → 人声分离（SSE）
 POST /stream/align     → 歌词生成/对齐（SSE）
 POST /stream/mv2ktv    → MV转KTV视频（SSE）
+POST /stream/asr       → ASR 语音识别（SSE，done 事件含 text/ts_text）
   事件类型: started / progress / done / error
   done 事件含 job_id，可用 /result/{job_id}/{filename} 下载文件
 """
@@ -124,6 +126,27 @@ def _run_align_job(job_id: str, audio_path: str, lyrics_text: str | None = None)
             if lrc_line:
                 _update_job(job_id, lrc_line=lrc_line)
         _update_job(job_id, status="done")
+    except Exception as e:
+        _error_job(job_id, str(e))
+
+
+def _run_asr_job(job_id: str, audio_path: str):
+    """纯 ASR 语音识别：SenseVoice 听写输出文本（独立于歌词生成/对齐管线）"""
+    import sensevoice_asr
+    try:
+        ready_ok, last_msg = False, ""
+        for ready, msg in sensevoice_asr.wait_ready():
+            last_msg = msg or ""
+            if ready:
+                ready_ok = True
+                break
+            _update_job(job_id, progress=msg)
+        if not ready_ok:
+            _error_job(job_id, last_msg)
+            return
+        _update_job(job_id, progress="🗣️ 语音识别中...")
+        text, ts_text = sensevoice_asr.transcribe(audio_path)
+        _update_job(job_id, text=text, ts_text=ts_text, status="done")
     except Exception as e:
         _error_job(job_id, str(e))
 
@@ -246,6 +269,33 @@ def _stream_align(job_id: str, audio_path: str, lyrics_text: str | None = None):
         yield _sse("error", {"job_id": job_id, "error": str(e)})
 
 
+def _stream_asr(job_id: str, audio_path: str):
+    """[SSE] 纯 ASR 语音识别：SenseVoice 听写（done 事件含 text/ts_text）"""
+    import sensevoice_asr
+    yield _sse("started", {"job_id": job_id, "type": "asr"})
+    try:
+        ready_ok, last_msg = False, ""
+        for ready, msg in sensevoice_asr.wait_ready():
+            last_msg = msg or ""
+            if ready:
+                ready_ok = True
+                break
+            _update_job(job_id, progress=msg)
+            yield _sse("progress", {"progress": msg})
+        if not ready_ok:
+            _error_job(job_id, last_msg)
+            yield _sse("error", {"job_id": job_id, "error": last_msg})
+            return
+        yield _sse("progress", {"progress": "🗣️ 语音识别中..."})
+        text, ts_text = sensevoice_asr.transcribe(audio_path)
+        result = {"text": text, "ts_text": ts_text}
+        _update_job(job_id, status="done", **result)
+        yield _sse("done", {"job_id": job_id, **result})
+    except Exception as e:
+        _error_job(job_id, str(e))
+        yield _sse("error", {"job_id": job_id, "error": str(e)})
+
+
 def _stream_mv2ktv(job_id: str, video_path: str, lyrics_text: str, style_preset: str):
     """[SSE] MV转KTV视频"""
     from video_processing import mv_to_ktv
@@ -311,6 +361,13 @@ async def submit_align(file: UploadFile = File(...), lyricsText: str | None = Fo
     return _start_job("align", lambda jid: _run_align_job(jid, path, lyricsText))
 
 
+@app.post("/submit/asr", tags=["ASR语音识别：SenseVoice 纯转写（不生成歌词）"])
+async def submit_asr(file: UploadFile = File(...)):
+    """ASR 语音识别：SenseVoice 听写，返回纯文本与带时间戳分段（不参与歌词管线）"""
+    path = _save_upload(file)
+    return _start_job("asr", lambda jid: _run_asr_job(jid, path))
+
+
 @app.post("/submit/mv2ktv", tags=["MV转KTV视频：提取音频→分离→歌词→ASS字幕→多音轨视频"])
 async def submit_mv2ktv(file: UploadFile = File(...),
                         lyricsText: str | None = Form(None),
@@ -369,6 +426,25 @@ def stream_align(file: UploadFile = File(...), lyricsText: str | None = Form(Non
     job_id = _create_stream_job("align")
     return StreamingResponse(
         _stream_align(job_id, path, lyricsText),
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
+
+
+@app.post("/stream/asr", tags=["SSE流式：ASR语音识别（SenseVoice 纯转写）"])
+def stream_asr(file: UploadFile = File(...)):
+    """SSE 流式 ASR 语音识别，实时推送进度
+
+    事件流：
+      event: started  → data: {"job_id":"...","type":"asr"}
+      event: progress → data: {"progress":"⏱️ 00:05 | 🗣️ 语音识别中... 40%"}
+      event: done     → data: {"job_id":"...","text":"...","ts_text":"[00:01.20] ..."}
+      event: error    → data: {"job_id":"...","error":"..."}
+    """
+    path = _save_upload(file)
+    job_id = _create_stream_job("asr")
+    return StreamingResponse(
+        _stream_asr(job_id, path),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
