@@ -34,6 +34,7 @@ _ready = threading.Event()         # 模型就绪事件
 _error: str | None = None          # 加载失败信息
 _load_started = False
 _load_start_time = 0.0
+_heal_attempts = 0                 # 粘性错误自愈重试次数（防模型损坏时无限循环）
 
 _SENTENCE_ENDS = "。！？；?!;，,、"   # 分段标点（句末优先换行）
 
@@ -93,6 +94,8 @@ def _load():
                 use_itn=True,
             )
             _ready.set()
+            global _heal_attempts
+            _heal_attempts = 0
             print("✅ [后台] SenseVoice 加载完成", flush=True)
             return
         except Exception as e:  # noqa: BLE001
@@ -105,8 +108,20 @@ def _load():
 
 
 def ensure_ready() -> tuple[bool, str | None]:
-    """未加载时触发后台加载，返回 (ok, 错误信息)"""
-    global _load_started
+    """未加载时触发后台加载，返回 (ok, 错误信息)
+
+    自愈：曾加载失败（典型场景：点识别时模型还没下载完，3 次重试后 _error 粘住）后，
+    每次调用先重新探测模型文件——已出现则清错误重启加载，否则下载完成后永远报"未找到模型"。
+    自愈最多 3 次，防止模型文件损坏导致无限重试。
+    """
+    global _load_started, _error, _heal_attempts
+    if _error is not None and _resolve_model_dir(config.SENSEVOICE_MODEL):
+        if _heal_attempts < 3:
+            _heal_attempts += 1
+            print(f"🔄 [自愈] 检测到模型文件已就位，清除历史失败状态并重新加载（第 {_heal_attempts}/3 次）", flush=True)
+            _error = None
+            _load_started = False
+            _ready.clear()
     if not _load_started:
         _load_started = True
         threading.Thread(target=_load, daemon=True).start()
@@ -123,6 +138,10 @@ def wait_ready():
     ensure_ready()
     while not _ready.is_set():
         if _error:
+            if _resolve_model_dir(config.SENSEVOICE_MODEL):
+                ensure_ready()  # 模型文件已出现：清错误重启加载，继续等
+                time.sleep(3)
+                continue
             yield False, f"❌ SenseVoice 加载失败: {_error}"
             return
         elapsed = int(time.time() - _load_start_time)
@@ -133,11 +152,12 @@ def wait_ready():
 
 def reset():
     """[模型管理] 删除缓存后重置运行时状态，下次识别将重新加载"""
-    global _recognizer, _error, _load_started, _load_start_time
+    global _recognizer, _error, _load_started, _load_start_time, _heal_attempts
     _recognizer = None
     _error = None
     _load_started = False
     _load_start_time = 0.0
+    _heal_attempts = 0
     _ready.clear()
 
 

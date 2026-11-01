@@ -107,7 +107,8 @@ WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "zh")
 # stable-ts（默认）: whisper 识别 + DTW 锚定，锚点质量受歌声识别精度制约
 # qwen3: Qwen3-ForcedAligner-0.6B（非自回归专用对齐模型），文本↔音频直接对齐，
 #        不经识别环节，原生支持中文/粤语；加载失败自动回退 stable-ts
-ALIGN_BACKEND = os.environ.get("ALIGN_BACKEND", "stable-ts").strip().lower()
+# 运行时切换持久化：前端下拉优先（写 output/.align_backend_pref），环境变量仅作初始默认
+ALIGN_BACKEND = _load_model_pref("ALIGN_BACKEND", "stable-ts").strip().lower()
 # Aligner 模型：HF/ModelScope 仓库名或本地目录（from_pretrained 自动下载到 HF_CACHE）
 ALIGNER_MODEL = os.environ.get("ALIGNER_MODEL", "Qwen/Qwen3-ForcedAligner-0.6B")
 

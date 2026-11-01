@@ -108,10 +108,10 @@ python app.py
 | 模式 | Demucs | Whisper | Docker 默认 |
 |------|--------|---------|------------|
 | Intel GPU (Arc / UHD) | OpenVINO (int8) | CPU (int8) | ✅ 已集成 |
-| NVIDIA GPU | CUDA (float16) | CUDA (float16) | ⚠️ 代码骨架已预留 |
+| NVIDIA GPU | CUDA (float16) | CUDA (float16) | ❌ 镜像为 CPU-only torch 精简版，需另建 CUDA 变体 |
 | 纯 CPU | CPU (float32) | CPU (int8) | ✅ 已集成 |
 
-`config.py` 的 `detect_best_devices()` 会自动探测 NVIDIA GPU，但当前 Docker 镜像只安装了 Intel + CPU 依赖。如需启用 CUDA，需在 `dockerfile` 中额外安装 NVIDIA CUDA 版依赖（`torch` + `ctranslate2` 等），并在 `docker-compose.yaml` 中配置 GPU 设备映射。
+镜像内 torch 为 **CPU-only wheel**（不含 CUDA 与 nvidia-* 运行时，省 ~4-5GB），目标硬件为 Intel iGPU/CPU。`config.py` 的 `detect_best_devices()` 仍会探测 NVIDIA GPU，代码骨架保留；如需 CUDA 加速，需另建变体镜像：`dockerfile` 中把 torch 换回 CUDA 版（`pip install torch --index-url https://download.pytorch.org/whl/cu124`），并在 `docker-compose.yaml` 中配置 GPU 设备映射。
 
 ## 环境变量
 
@@ -123,7 +123,7 @@ python app.py
 | `HF_ENDPOINT` | `hf-mirror.com` | HuggingFace 镜像（国内加速） |
 | `DEMUCS_MODEL` | `mdx_extra` | 默认 Demucs 模型 |
 | `WHISPER_MODEL` | `medium` | 默认 Whisper 模型 |
-| `ALIGN_BACKEND` | `stable-ts` | 歌词对齐后端：`stable-ts` / `qwen3`（阿里 Qwen3-ForcedAligner，失败自动回退） |
+| `ALIGN_BACKEND` | `stable-ts` | 歌词对齐后端：`stable-ts` / `qwen3`（阿里 Qwen3-ForcedAligner，失败自动回退）；**前端 ⚙️ 模型管理 可运行时切换**（选择持久化到 `output/.align_backend_pref`，优先于环境变量） |
 | `ALIGNER_MODEL` | `Qwen/Qwen3-ForcedAligner-0.6B` | 对齐模型 HF/ModelScope 仓库名或本地目录 |
 | `SENSEVOICE_MODEL` | `csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17` | ASR 识别模型 HF 仓库名或本地目录 |
 

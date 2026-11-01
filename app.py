@@ -21,7 +21,8 @@ from model_manager import (is_whisper_cached, is_demucs_cached,
                            is_aligner_cached, get_aligner_cache_size,
                            aligner_dl_btn, aligner_redl_btns, aligner_del_btns,
                            is_sensevoice_cached, get_sensevoice_cache_size,
-                           sensevoice_dl_btn, sensevoice_redl_btns, sensevoice_del_btns)
+                           sensevoice_dl_btn, sensevoice_redl_btns, sensevoice_del_btns,
+                           switch_align_backend)
 from processing import separate_vocals, align_lyrics, one_click_karaoke
 from video_processing import mv_to_ktv, PRESET_CHOICES
 
@@ -113,9 +114,10 @@ with gr.Blocks(
         gr.Markdown(
             "上传MV视频 → 提取音频 → 分离人声伴奏 → 生成逐词歌词 → 烧录卡拉OK字幕 → **多音轨KTV视频**\n\n"
             "💡 **多音轨说明**：输出视频包含两条音轨（音轨1=原唱，音轨2=纯伴奏），播放器可切换\n\n"
-            "💡 **歌词来源**：填写歌词文本则用对齐（更精准），留空则自动听写\n\n"
-            f"{_align_backend_note()}"
+            "💡 **歌词来源**：填写歌词文本则用对齐（更精准），留空则自动听写"
         )
+        # 对齐后端说明：独立组件，运行时切换后端时同步刷新
+        mv_align_note = gr.Markdown(_align_backend_note())
         with gr.Row():
             mv_video = gr.Video(label="上传MV视频", height=320)
             mv_lyrics = gr.Textbox(
@@ -175,9 +177,9 @@ with gr.Blocks(
     with gr.Tab("🎯 歌词生成对齐"):
         gr.Markdown(
             "上传音频 → 自动生成逐词 LRC 歌词\n\n"
-            "💡 **无歌词**：自动听写生成歌词（适合没有歌词文本的情况）\n"
-            f"{_align_backend_note()}"
+            "💡 **无歌词**：自动听写生成歌词（适合没有歌词文本的情况）"
         )
+        align_backend_note_md = gr.Markdown(_align_backend_note())
         with gr.Row():
             align_audio = gr.Audio(type="filepath", label="上传音频/人声", elem_classes="rw-audio")
             align_lyrics_input = gr.Textbox(
@@ -219,8 +221,20 @@ with gr.Blocks(
         with gr.Row():
             whisper_dd = gr.Dropdown(AVAILABLE_WHISPER, value=config.WHISPER_MODEL, label="🎙️ Whisper 模型", interactive=True, info="仅已下载的模型可切换")
             demucs_dd = gr.Dropdown(AVAILABLE_DEMUCS, value=config.DEMUCS_MODEL, label="🎵 Demucs 模型", interactive=True, info="仅已下载的模型可切换")
+            align_dd = gr.Dropdown(["stable-ts", "qwen3"], value=config.ALIGN_BACKEND,
+                                   label="🎯 歌词对齐后端", interactive=True,
+                                   info="有歌词时的对齐引擎；qwen3=阿里 Qwen3-ForcedAligner（失败自动回退 stable-ts）；无歌词听写恒为 Whisper")
         whisper_dd.change(fn=switch_whisper_model, inputs=[whisper_dd], outputs=[whisper_dd])
         demucs_dd.change(fn=switch_demucs_model, inputs=[demucs_dd], outputs=[demucs_dd])
+
+        def _switch_align_backend_ui(backend):
+            """切换对齐后端：同步刷新下拉框/状态栏/两个 Tab 的说明文案"""
+            new_backend = switch_align_backend(backend)
+            note = _align_backend_note()
+            return new_backend, get_status_html(), note, note
+
+        align_dd.change(fn=_switch_align_backend_ui, inputs=[align_dd],
+                        outputs=[align_dd, status_md, mv_align_note, align_backend_note_md])
         def _render_model_list(title, models, sizes_map, is_cached_fn, get_size_fn, dl_fn, redl_fn, del_fn):
             """[UI 构建] 每个模型占两行：第1行 名称+大小 | 按钮，第2行 操作状态"""
             gr.Markdown(title)
@@ -270,14 +284,14 @@ with gr.Blocks(
                             _al_redl_btn = gr.Button("🔄重下", variant="secondary", size="sm", visible=_al_cached)
                             _al_del_btn = gr.Button("🗑删除", variant="secondary", size="sm", visible=_al_cached, elem_classes="delete-btn")
                 _al_st = gr.Textbox(show_label=False, lines=1, max_lines=1, elem_classes="status-box")
-                if _al_cached:
-                    _al_redl_btn.click(fn=aligner_redl_btns, inputs=[_al_state],
-                                       outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
-                    _al_del_btn.click(fn=aligner_del_btns, inputs=[_al_state],
-                                      outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
-                else:
-                    _al_dl_btn.click(fn=aligner_dl_btn, inputs=[_al_state],
-                                     outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
+                # 三个按钮无条件绑定（可见性由初始状态/demo.load 刷新控制）——
+                # 若按初始缓存状态条件绑定，页面刷新后可见按钮可能没有挂事件
+                _al_dl_btn.click(fn=aligner_dl_btn, inputs=[_al_state],
+                                 outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
+                _al_redl_btn.click(fn=aligner_redl_btns, inputs=[_al_state],
+                                   outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
+                _al_del_btn.click(fn=aligner_del_btns, inputs=[_al_state],
+                                  outputs=[_al_st, _al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md])
 
         with gr.Row():
             with gr.Column():
@@ -295,14 +309,32 @@ with gr.Blocks(
                             _sv_redl_btn = gr.Button("🔄重下", variant="secondary", size="sm", visible=_sv_cached)
                             _sv_del_btn = gr.Button("🗑删除", variant="secondary", size="sm", visible=_sv_cached, elem_classes="delete-btn")
                 _sv_st = gr.Textbox(show_label=False, lines=1, max_lines=1, elem_classes="status-box")
-                if _sv_cached:
-                    _sv_redl_btn.click(fn=sensevoice_redl_btns, inputs=[_sv_state],
-                                       outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
-                    _sv_del_btn.click(fn=sensevoice_del_btns, inputs=[_sv_state],
-                                      outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
-                else:
-                    _sv_dl_btn.click(fn=sensevoice_dl_btn, inputs=[_sv_state],
-                                     outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
+                _sv_dl_btn.click(fn=sensevoice_dl_btn, inputs=[_sv_state],
+                                 outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
+                _sv_redl_btn.click(fn=sensevoice_redl_btns, inputs=[_sv_state],
+                                   outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
+                _sv_del_btn.click(fn=sensevoice_del_btns, inputs=[_sv_state],
+                                  outputs=[_sv_st, _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md])
+
+    # ---- 页面加载时刷新“单模型卡片”的缓存状态 ----
+    # Gradio 组件的可见性/取值在容器启动构建 Blocks 时固化，浏览器刷新页面不会重新求值，
+    # 导致“启动时未下载 → 下载完成后刷新页面仍显示未下载”。用 demo.load 每次打开页面时重查。
+    def _refresh_single_model_cards():
+        _al_c = is_aligner_cached(config.ALIGNER_MODEL)
+        _sv_c = is_sensevoice_cached(config.SENSEVOICE_MODEL)
+        return (
+            gr.update(visible=not _al_c), gr.update(visible=_al_c), gr.update(visible=_al_c),
+            gr.update(value=f"**{config.ALIGNER_MODEL}**  ({get_aligner_cache_size(config.ALIGNER_MODEL)})"),
+            gr.update(visible=not _sv_c), gr.update(visible=_sv_c), gr.update(visible=_sv_c),
+            gr.update(value=f"**{config.SENSEVOICE_MODEL}**  ({get_sensevoice_cache_size(config.SENSEVOICE_MODEL)})"),
+        )
+
+    demo.load(
+        fn=_refresh_single_model_cards,
+        inputs=None,
+        outputs=[_al_dl_btn, _al_redl_btn, _al_del_btn, _al_size_md,
+                 _sv_dl_btn, _sv_redl_btn, _sv_del_btn, _sv_size_md],
+    )
 
     # 自定义底部 API 链接（替换 Gradio 默认的 /view_api 链接）
     gr.HTML(

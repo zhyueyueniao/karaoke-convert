@@ -565,6 +565,40 @@ def switch_demucs_model(model_name: str) -> str:
     return model_name
 
 
+def switch_align_backend(backend: str) -> str:
+    """[运行时切换] 歌词对齐后端（stable-ts / qwen3），立即生效并持久化
+
+    - 切到 qwen3：触发 Qwen3-ForcedAligner 后台预加载（未下载会在首次对齐时提示下载）
+    - 切回 stable-ts：reset() 卸载 Qwen3 释放内存（加载失败本就自动回退，卸载无副作用）
+    - 无歌词听写恒为 Whisper，不受此开关影响
+    """
+    import config
+    backend = (backend or "").strip().lower()
+    if backend not in ("stable-ts", "qwen3"):
+        gr.Warning(f"无效的对齐后端: {backend}")
+        return config.ALIGN_BACKEND
+    if backend == config.ALIGN_BACKEND:
+        gr.Info(f"已在使用 {backend}，无需切换")
+        return backend
+    config.ALIGN_BACKEND = backend
+    config._save_model_pref("ALIGN_BACKEND", backend)
+    if backend == "qwen3":
+        try:
+            import qwen_aligner
+            qwen_aligner.ensure_ready()
+        except Exception:
+            pass
+        gr.Info("已切换到 Qwen3 对齐（模型后台加载中，就绪前对齐自动走 stable-ts）")
+    else:
+        try:
+            import qwen_aligner
+            qwen_aligner.reset()  # 卸载实例释放内存
+        except Exception:
+            pass
+        gr.Info("已切换到 stable-ts 对齐（whisper 识别 + DTW）")
+    return backend
+
+
 # ---- UI 按钮包装生成器（控制按钮禁用/显示状态 + 完成后更新模型大小显示） ----
 
 def whisper_dl_btn(model_name):
