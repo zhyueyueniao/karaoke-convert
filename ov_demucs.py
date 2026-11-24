@@ -40,6 +40,9 @@ _torch_lock = threading.Lock()
 _compiled = None            # 当前 (model, precision) 的 CompiledModel
 _compiled_key = None        # (model, precision, mtime)
 _compile_lock = threading.Lock()
+# [2026-11-24] CompiledModel 进程内单例、内部只有一个同步 InferRequest：
+# 并发分离请求（在跑的恢复流 + 管理端 dryRun）必须串行调用，否则报 "Infer Request is busy"。
+_infer_lock = threading.Lock()
 
 
 def is_supported_model(name: str) -> bool:
@@ -290,7 +293,8 @@ def separate(mix: np.ndarray, overlap: float = 0.1, precision: str | None = None
             # --- GPU：两分支主干 ---
             args = [x.numpy(), xt.numpy(), std.numpy(), mean.numpy(),
                     stdt.numpy(), meant.numpy()]
-            o = compiled(args)
+            with _infer_lock:
+                o = compiled(args)
 
             # --- CPU：官方 mask + ISTFT + 时间支 ---
             mask = th.from_numpy(np.asarray(o[0]).astype(np.float32))

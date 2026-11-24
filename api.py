@@ -104,10 +104,10 @@ def _run_karaoke_job(job_id: str, audio_path: str, lyrics_text: str | None = Non
         _error_job(job_id, str(e))
 
 
-def _run_separate_job(job_id: str, audio_path: str):
+def _run_separate_job(job_id: str, audio_path: str, accomp_only: bool = False):
     from processing import _run_demucs
     try:
-        gen = _run_demucs(audio_path)
+        gen = _run_demucs(audio_path, accomp_only=accomp_only)
         for vocal, accomp, status in gen:
             _update_job(job_id, progress=status)
             if vocal:
@@ -230,13 +230,13 @@ def _stream_karaoke(job_id: str, audio_path: str, lyrics_text: str | None = None
         yield _sse("error", {"job_id": job_id, "error": str(e)})
 
 
-def _stream_separate(job_id: str, audio_path: str):
-    """[SSE] 人声分离"""
+def _stream_separate(job_id: str, audio_path: str, accomp_only: bool = False):
+    """[SSE] 人声分离（accomp_only=True 时跳过人声 mp3 编码与回传）"""
     from processing import _run_demucs
     yield _sse("started", {"job_id": job_id, "type": "separate"})
     result: dict = {}
     try:
-        for vocal, accomp, status in _run_demucs(audio_path):
+        for vocal, accomp, status in _run_demucs(audio_path, accomp_only=accomp_only):
             _update_job(job_id, progress=status)
             if vocal: result["vocal_path"] = vocal
             if accomp: result["accomp_path"] = accomp
@@ -351,9 +351,9 @@ async def submit_karaoke(file: UploadFile = File(...), lyricsText: str | None = 
 
 
 @app.post("/submit/separate", tags=["人声伴奏分离"])
-async def submit_separate(file: UploadFile = File(...)):
+async def submit_separate(file: UploadFile = File(...), accomp_only: bool = Form(False)):
     path = _save_upload(file)
-    return _start_job("separate", lambda jid: _run_separate_job(jid, path))
+    return _start_job("separate", lambda jid: _run_separate_job(jid, path, accomp_only))
 
 
 @app.post("/submit/align", tags=["歌词生成/对齐：无歌词听写，有歌词对齐"])
@@ -409,12 +409,12 @@ def stream_karaoke(file: UploadFile = File(...), lyricsText: str | None = Form(N
 
 
 @app.post("/stream/separate", tags=["SSE流式：人声伴奏分离"])
-def stream_separate(file: UploadFile = File(...)):
-    """SSE 流式人声分离，实时推送进度"""
+def stream_separate(file: UploadFile = File(...), accomp_only: bool = Form(False)):
+    """SSE 流式人声分离，实时推送进度；accomp_only=true 只返回伴奏（省一半编码与传输）"""
     path = _save_upload(file)
     job_id = _create_stream_job("separate")
     return StreamingResponse(
-        _stream_separate(job_id, path),
+        _stream_separate(job_id, path, accomp_only),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )

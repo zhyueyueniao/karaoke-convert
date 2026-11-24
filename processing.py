@@ -76,13 +76,16 @@ def _find_demucs_outputs(base_name: str) -> tuple[str | None, str | None]:
 
 # ---- 人声分离 ----
 
-def _run_demucs_ov(audio_file):
+def _run_demucs_ov(audio_file, accomp_only: bool = False):
     """[OV-ONNX-20261124] OpenVINO ONNX 推理管线（DEMUCS_DEVICE=openvino 时替代 demucs CLI）。
 
     生成器契约与 _run_demucs 完全一致：
     - 进行中: (None, None, "进度...")
     - 完成: (vocal_path, accomp_path, "✅ 完成")
     输出文件与 demucs CLI 相同：{base}_vocals.mp3 / {base}_accomp.mp3（192k）。
+
+    accomp_only=True（音轨恢复等只要伴奏的场景）：跳过人声 mp3 编码和回传，
+    省一半编码与 HTTP base64 传输；vocal_path 返回 None，调用方不应依赖它。
     """
     import ov_demucs
 
@@ -106,26 +109,32 @@ def _run_demucs_ov(audio_file):
         except StopIteration as e:
             stems = e.value
 
-        yield None, None, f"⏱️ {_fmt_elapsed(start)} | ✍️ 编码伴奏/人声 mp3（并行）..."
         acc = ov_demucs.split_accompaniment(stems)
-        voc = ov_demucs.split_vocals(stems)
-        t_enc = threading.Thread(target=ov_demucs.write_stereo_mp3, args=(voc, vocal_path))
-        t_enc.start()
-        ov_demucs.write_stereo_mp3(acc, accomp_path)
-        t_enc.join()
-
-        yield vocal_path, accomp_path, f"⏱️ {_fmt_elapsed(start)} | ✅ 人声+伴奏分离完成 (OV)"
+        if accomp_only:
+            yield None, None, f"⏱️ {_fmt_elapsed(start)} | ✍️ 仅编码伴奏 mp3（跳过人声）..."
+            ov_demucs.write_stereo_mp3(acc, accomp_path)
+            yield None, accomp_path, f"⏱️ {_fmt_elapsed(start)} | ✅ 伴奏分离完成 (OV, 仅伴奏)"
+        else:
+            yield None, None, f"⏱️ {_fmt_elapsed(start)} | ✍️ 编码伴奏/人声 mp3（并行）..."
+            voc = ov_demucs.split_vocals(stems)
+            t_enc = threading.Thread(target=ov_demucs.write_stereo_mp3, args=(voc, vocal_path))
+            t_enc.start()
+            ov_demucs.write_stereo_mp3(acc, accomp_path)
+            t_enc.join()
+            yield vocal_path, accomp_path, f"⏱️ {_fmt_elapsed(start)} | ✅ 人声+伴奏分离完成 (OV)"
     except Exception as e:
         print(f"❌ OV Demucs 失败: {e}", flush=True)
         yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 分离异常: {str(e)}"
 
 
-def _run_demucs(audio_file):
+def _run_demucs(audio_file, accomp_only: bool = False):
     """[核心] 调用 Demucs 分离人声+伴奏，Popen 实时解析 tqdm 进度条
     
     生成器 yield: (vocal_path, accomp_path, 状态文字)
     - 进行中: (None, None, "进度...")
     - 完成: (path, path, "✅ 完成")
+    accomp_only 仅对 OpenVINO hybrid 管线生效；demucs CLI 回退路径仍输出两个文件
+    （CLI 无现成跳过人声输出的开关，多余文件不影响调用方）。
     """
     if audio_file is None:
         yield None, None, "❌ 请上传音频文件"
@@ -137,7 +146,7 @@ def _run_demucs(audio_file):
     if config.DEMUCS_DEVICE == "openvino":
         import ov_demucs
         if ov_demucs.is_supported_model(config.DEMUCS_MODEL):
-            yield from _run_demucs_ov(audio_file)
+            yield from _run_demucs_ov(audio_file, accomp_only=accomp_only)
             return
         print(f"⚠️ 模型 {config.DEMUCS_MODEL} 不支持 OpenVINO GPU hybrid"
               f"（仅支持 {'/'.join(ov_demucs.SUPPORTED_MODELS)}），本次分离回退 demucs CLI（CPU）",
