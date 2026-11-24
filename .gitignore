@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual env (local dev)
+venv/
+.venv/
+
+# 运行时挂载卷 / 模型缓存（NAS 部署时为独立卷，不入库）
+output/
+workspace/
+model_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

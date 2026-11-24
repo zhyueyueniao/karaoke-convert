@@ -64,7 +64,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # app.py 等通过 volume 热挂载，这一层只有文件拷贝，瞬间完成
 WORKDIR /app
 COPY app.py api.py config.py model_loader.py model_manager.py processing.py \
-     qwen_aligner.py sensevoice_asr.py /app/
+     ov_demucs.py qwen_aligner.py sensevoice_asr.py /app/
 RUN mkdir -p /app/output /app/workspace
 
 EXPOSE 7860

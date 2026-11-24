@@ -220,7 +220,8 @@ with gr.Blocks(
         gr.Markdown("下载/管理模型，仅已下载的模型可切换")
         with gr.Row():
             whisper_dd = gr.Dropdown(AVAILABLE_WHISPER, value=config.WHISPER_MODEL, label="🎙️ Whisper 模型", interactive=True, info="仅已下载的模型可切换")
-            demucs_dd = gr.Dropdown(AVAILABLE_DEMUCS, value=config.DEMUCS_MODEL, label="🎵 Demucs 模型", interactive=True, info="仅已下载的模型可切换")
+            demucs_dd = gr.Dropdown(AVAILABLE_DEMUCS, value=config.DEMUCS_MODEL, label="🎵 Demucs 模型", interactive=True,
+                                    info="仅已下载的模型可切换；OpenVINO 加速模式下仅 htdemucs/htdemucs_ft 支持 GPU（其余自动回退 CPU）")
             align_dd = gr.Dropdown(["stable-ts", "qwen3"], value=config.ALIGN_BACKEND,
                                    label="🎯 歌词对齐后端", interactive=True,
                                    info="有歌词时的对齐引擎；qwen3=阿里 Qwen3-ForcedAligner（失败自动回退 stable-ts）；无歌词听写恒为 Whisper")
@@ -235,16 +236,17 @@ with gr.Blocks(
 
         align_dd.change(fn=_switch_align_backend_ui, inputs=[align_dd],
                         outputs=[align_dd, status_md, mv_align_note, align_backend_note_md])
-        def _render_model_list(title, models, sizes_map, is_cached_fn, get_size_fn, dl_fn, redl_fn, del_fn):
-            """[UI 构建] 每个模型占两行：第1行 名称+大小 | 按钮，第2行 操作状态"""
+        def _render_model_list(title, models, sizes_map, is_cached_fn, get_size_fn, dl_fn, redl_fn, del_fn, note_fn=None):
+            """[UI 构建] 每个模型占两行：第1行 名称+大小(+附注) | 按钮，第2行 操作状态"""
             gr.Markdown(title)
             for m in models:
                 cached = is_cached_fn(m)
                 size = get_size_fn(m) if cached else sizes_map[m]
+                note = note_fn(m) if note_fn else ""
                 btn_state = gr.State(m)
                 with gr.Row(equal_height=True, elem_classes="model-row"):
                     with gr.Column(scale=0):
-                        size_md = gr.Markdown(f"**{m}**  ({size})")
+                        size_md = gr.Markdown(f"**{m}**  ({size}){note}")
                     with gr.Column(scale=0):
                         with gr.Row():
                             dl_btn = gr.Button("📥下载", variant="primary", size="sm", visible=not cached, elem_classes="download-btn")
@@ -263,9 +265,16 @@ with gr.Blocks(
                                    is_whisper_cached, get_whisper_cache_size,
                                    whisper_dl_btn, whisper_redl_btns, whisper_del_btns)
             with gr.Column():
+                def _demucs_note(m):
+                    """OpenVINO 模式下不支持 GPU hybrid 的模型加灰色提示"""
+                    if config.DEMUCS_DEVICE == "openvino" and m not in config.OV_HYBRID_SUPPORTED_DEMUCS:
+                        return "　*⚠️ 不支持GPU加速，分离自动回退 CPU*"
+                    return ""
+
                 _render_model_list("**🎵 Demucs 模型**", AVAILABLE_DEMUCS, DEMUCS_SIZES,
                                    is_demucs_cached, get_demucs_cache_size,
-                                   demucs_dl_btn, demucs_redl_btns, demucs_del_btns)
+                                   demucs_dl_btn, demucs_redl_btns, demucs_del_btns,
+                                   note_fn=_demucs_note)
             with gr.Column():
                 # ---- 🎯 对齐后端（Qwen3-ForcedAligner，仅一个模型） ----
                 gr.Markdown("**🎯 对齐模型（阿里 Qwen3）**")

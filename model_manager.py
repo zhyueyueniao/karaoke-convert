@@ -561,7 +561,11 @@ def switch_demucs_model(model_name: str) -> str:
         return config.DEMUCS_MODEL
     config.DEMUCS_MODEL = model_name
     config._save_model_pref("DEMUCS_MODEL", model_name)
-    gr.Info(f"已切换到 {model_name}")
+    if (config.DEMUCS_DEVICE == "openvino"
+            and model_name not in config.OV_HYBRID_SUPPORTED_DEMUCS):
+        gr.Warning(f"已切换到 {model_name}（注：该模型不支持 OpenVINO GPU 加速，分离将走 demucs CLI/CPU）")
+    else:
+        gr.Info(f"已切换到 {model_name}")
     return model_name
 
 
@@ -684,3 +688,4 @@ def sensevoice_del_btns(model_name: str):
         done, ok = _is_done(msg), "✅" in msg
         size_update = gr.update(value=f"**{model_name}**  {SENSEVOICE_FALLBACK_SIZE}") if ok else gr.update()
         yield msg, gr.update(interactive=done, visible=ok), gr.update(interactive=done, visible=not ok), gr.update(interactive=done, visible=not ok), size_update
+

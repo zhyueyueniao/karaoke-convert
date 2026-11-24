@@ -121,6 +121,12 @@ SENSEVOICE_MODEL = os.environ.get(
 AVAILABLE_WHISPER = ["tiny", "base", "small", "medium", "large-v3"]
 AVAILABLE_DEMUCS  = ["mdx_extra", "mdx_q", "htdemucs", "htdemucs_ft", "mdx"]
 
+# [OV-GPU-20261124] OpenVINO GPU hybrid 管线（ov_demucs.py）仅支持 HTDemucs 架构：
+# 主干封装复刻的是 HTDemucs.forward（双分支+交叉 Transformer）；mdx 系列（mdx_extra/
+# mdx_q/mdx）是经典 Demucs（无时间分支），forward 结构不同，不能套用——
+# openvino 模式下选这些模型会自动回退 demucs CLI（CPU），UI 中有灰色提示。
+OV_HYBRID_SUPPORTED_DEMUCS = ["htdemucs", "htdemucs_ft"]
+
 HF_CACHE = "/root/.cache/huggingface"
 # 统一 HuggingFace 缓存目录：huggingface_hub 默认按 HF_HOME/HF_HUB_CACHE 环境变量决定
 # 缓存位置（hub>=1.0 时默认是 $HF_HOME/hub，而非 HF_HOME 本身），而 model_manager 下载时

@@ -18,14 +18,19 @@ POST /stream/mv2ktv    → MV转KTV视频（SSE）
 POST /stream/asr       → ASR 语音识别（SSE，done 事件含 text/ts_text）
   事件类型: started / progress / done / error
   done 事件含 job_id，可用 /result/{job_id}/{filename} 下载文件
+
+【同步模式】短音频低延迟场景（如棋牌项目「按住说话」）
+POST /asr/sync         → ASR 同步转写，一次请求直接返回 {"text","ts_text","elapsed_ms"}
+  不建 job、不写 jobs 字典、不推 SSE；自带大小/并发限制、可选 token、临时文件清理。
 """
 import os
 import json
+import time
 import uuid
 import threading
 import tempfile
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 import uvicorn
 import config
@@ -471,6 +476,104 @@ def stream_mv2ktv(file: UploadFile = File(...),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
     )
+
+
+# ======================== 同步 ASR（短音频 / 低延迟语音输入） ========================
+# 与 /submit/asr + 轮询、/stream/asr(SSE) 的区别：一次 HTTP 请求直接返回结果，
+# 不创建 job、不写 jobs 字典、不推进度，省掉任务框架与轮询/SSE 解析开销。
+# 用 def（非 async def）：transcribe 是阻塞 CPU 推理，FastAPI 会放入线程池，不阻塞事件循环。
+# 面向内网调用（chess-and-cards 的 /api/asr 代理）；7861 端口不要暴露公网。
+ASR_SYNC_MAX_BYTES = int(os.getenv("ASR_SYNC_MAX_BYTES", str(10 * 1024 * 1024)))
+ASR_SYNC_TOKEN = os.getenv("ASR_SYNC_TOKEN", "").strip()
+ASR_SYNC_READY_TIMEOUT = float(os.getenv("ASR_SYNC_READY_TIMEOUT", "15"))
+_asr_sync_slots = threading.BoundedSemaphore(2)   # SenseVoice 为 CPU 推理，限制并发防互相拖慢
+
+
+def _remove_upload(path: str | None) -> None:
+    """删除同步端点产生的上传临时文件（submit/stream 端点的临时文件仍按历史行为保留）"""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _save_sync_upload(file: UploadFile) -> str:
+    """带大小上限地保存上传音频；调用方必须在 finally 中 _remove_upload。"""
+    data = file.file.read(ASR_SYNC_MAX_BYTES + 1)
+    if not data:
+        raise HTTPException(400, "上传文件为空")
+    if len(data) > ASR_SYNC_MAX_BYTES:
+        raise HTTPException(413, f"音频超过 {ASR_SYNC_MAX_BYTES // 1024 // 1024}MB 上限")
+    suffix = Path(file.filename or "audio").suffix[:16] or ".webm"
+    fd, path = tempfile.mkstemp(prefix="asr-sync-", suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        _remove_upload(path)
+        raise
+    return path
+
+
+@app.post("/asr/sync", tags=["同步ASR：短音频一次请求返回文本"])
+def asr_sync(file: UploadFile = File(...),
+             x_asr_token: str | None = Header(default=None, alias="X-ASR-Token")):
+    """同步 ASR 语音识别（SenseVoice）：上传音频 → 直接返回识别文本。
+
+    请求：multipart/form-data，字段 `file`（任意 ffmpeg 可解码格式：webm/opus、mp3、m4a、wav…）
+    响应：`{"text": "...", "ts_text": "[MM:SS.cc] ...", "elapsed_ms": 842}`
+    错误：401 token 无效（仅当设置 ASR_SYNC_TOKEN）／400 空文件或无语音／413 超限／
+          429 并发已满／503 模型未就绪或加载超时／500 解码或推理失败
+    环境变量：ASR_SYNC_MAX_BYTES（默认 10MB）、ASR_SYNC_TOKEN（默认空 = 不鉴权）、
+             ASR_SYNC_READY_TIMEOUT（默认 15s，只约束「等待模型加载」阶段）
+    与 SSE 端点一致：音频由 sensevoice_asr._to_wav16k 统一转 16k 单声道，前端零转码。
+    """
+    if ASR_SYNC_TOKEN and x_asr_token != ASR_SYNC_TOKEN:
+        raise HTTPException(401, "ASR token 无效")
+    if not _asr_sync_slots.acquire(blocking=False):
+        raise HTTPException(429, "ASR 并发已满，请稍后重试")
+
+    started = time.monotonic()
+    path = None
+    try:
+        path = _save_sync_upload(file)
+        import sensevoice_asr
+
+        # 模型为惰性后台加载；最多等 ASR_SYNC_READY_TIMEOUT 秒，超时让调用方重试而非挂住连接
+        deadline = started + ASR_SYNC_READY_TIMEOUT
+        ready, last_msg = False, "SenseVoice 模型未就绪"
+        for ok, msg in sensevoice_asr.wait_ready():
+            if msg:
+                last_msg = msg
+            if ok:
+                ready = True
+                break
+            if time.monotonic() >= deadline:
+                break
+        if not ready:
+            raise HTTPException(503, last_msg)
+
+        text, ts_text = sensevoice_asr.transcribe(path)
+        return {
+            "text": text,
+            "ts_text": ts_text,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - 统一转成可读的 HTTP 错误
+        msg = str(e)
+        if "识别结果为空" in msg:
+            raise HTTPException(400, "未识别到语音，请重说一次")
+        if "模型未就绪" in msg:
+            raise HTTPException(503, "SenseVoice 模型未就绪")
+        raise HTTPException(500, f"ASR 识别失败: {msg}")
+    finally:
+        _remove_upload(path)
+        _asr_sync_slots.release()
+
 
 
 @app.get("/status/{job_id}", tags=["查询任务"])

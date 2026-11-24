@@ -58,3 +58,45 @@ services:
       # - render          # Z425 若报错 render 组不存在，注释这一行换成下一行
       - "992"
 
+  # ---- 语音 sidecar：Qwen3-ASR（高精度识别）+ Qwen3-TTS（语音合成/音色克隆）独立容器 ----
+  # 独立项目（speech_service/），与主容器完全解耦；自带网页 http://<NAS-IP>:7862/
+  # （合成/克隆/识别，支持麦克风录音）。首次启动访问 :7862/docs，
+  # 通过 POST /models/download?kind=tts|tts-base|asr 下载模型（tts+asr 共约 8GB，克隆用 tts-base 再 +3.8GB）。
+  ktv-speech:
+    build: ./speech_service
+    image: ktv-speech:latest
+    container_name: ktv-speech
+    command: /opt/speech-venv/bin/python -u /app/speech/server.py
+    restart: unless-stopped
+    network_mode: bridge
+    ports:
+      - "7862:7862"
+    volumes:
+      # 代码热挂载：修改 speech_service/ 后 docker compose restart ktv-speech 即生效
+      - ./speech_service:/app/speech
+      # 模型持久化（modelscope 权重 ckpt + OpenVINO IR ov）
+      - ./model_cache/speech:/models
+    environment:
+      - ZES_ENABLE_SYSMAN=1
+      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HUB_ENABLE_HF_TRANSFER=0
+      - HF_HUB_DISABLE_XET=1
+      #- SPEECH_DEVICE=GPU          # 留空自动探测（GPU 优先）
+      #- SPEECH_TOKEN=              # 可选鉴权，主服务侧需同步设置 SPEECH_SYNC_TOKEN
+      #- TTS_DEFAULT_SPEAKER=Serena
+      #- TTS_BASE_IDLE_UNLOAD=30    # 克隆用 Base 模型空闲卸载阈值（分钟），0=常驻不卸载
+    deploy:
+      resources:
+        limits:
+          # 16G：CustomVoice+ASR 常驻约 8-9GB，克隆用 Base 模型惰性加载再加约 4GB
+          memory: 16G
+        reservations:
+          memory: 4G
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - "992"
+

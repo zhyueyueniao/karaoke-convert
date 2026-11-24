@@ -76,6 +76,50 @@ def _find_demucs_outputs(base_name: str) -> tuple[str | None, str | None]:
 
 # ---- 人声分离 ----
 
+def _run_demucs_ov(audio_file):
+    """[OV-ONNX-20261124] OpenVINO ONNX 推理管线（DEMUCS_DEVICE=openvino 时替代 demucs CLI）。
+
+    生成器契约与 _run_demucs 完全一致：
+    - 进行中: (None, None, "进度...")
+    - 完成: (vocal_path, accomp_path, "✅ 完成")
+    输出文件与 demucs CLI 相同：{base}_vocals.mp3 / {base}_accomp.mp3（192k）。
+    """
+    import ov_demucs
+
+    start = time.time()
+    try:
+        filename = os.path.basename(audio_file)
+        base_name = os.path.splitext(filename)[0]
+        vocal_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_vocals.mp3")
+        accomp_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_accomp.mp3")
+
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🔊 解码音频（OpenVINO ONNX 管线）..."
+        mix = ov_demucs.read_stereo_f32(audio_file)
+
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🧠 加载 OpenVINO 模型..."
+        gen = ov_demucs.separate(mix, overlap=0.1)
+        try:
+            while True:
+                done, total = next(gen)
+                pct = int(done * 100 / total)
+                yield None, None, f"⏱️ {_fmt_elapsed(start)} | 🔊 分离中 (OV)... {pct}%"
+        except StopIteration as e:
+            stems = e.value
+
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | ✍️ 编码伴奏/人声 mp3（并行）..."
+        acc = ov_demucs.split_accompaniment(stems)
+        voc = ov_demucs.split_vocals(stems)
+        t_enc = threading.Thread(target=ov_demucs.write_stereo_mp3, args=(voc, vocal_path))
+        t_enc.start()
+        ov_demucs.write_stereo_mp3(acc, accomp_path)
+        t_enc.join()
+
+        yield vocal_path, accomp_path, f"⏱️ {_fmt_elapsed(start)} | ✅ 人声+伴奏分离完成 (OV)"
+    except Exception as e:
+        print(f"❌ OV Demucs 失败: {e}", flush=True)
+        yield None, None, f"⏱️ {_fmt_elapsed(start)} | ❌ 分离异常: {str(e)}"
+
+
 def _run_demucs(audio_file):
     """[核心] 调用 Demucs 分离人声+伴奏，Popen 实时解析 tqdm 进度条
     
@@ -86,6 +130,18 @@ def _run_demucs(audio_file):
     if audio_file is None:
         yield None, None, "❌ 请上传音频文件"
         return
+    # [OV-GPU-20261124] DEMUCS_DEVICE=openvino 时走 hybrid 管线：torch CPU 做 STFT/归一化/
+    # mask/ISTFT，OpenVINO GPU 只跑两分支主干（fp16 约 0.45s/段，是旧 OV CPU 全模型的 3.3 倍）。
+    # 仅 HTDemucs 架构（htdemucs/htdemucs_ft）支持；mdx 系列是经典 Demucs（无时间分支），
+    # 主干封装不兼容——明确回退 demucs CLI（CPU），不再静默忽略所选模型。
+    if config.DEMUCS_DEVICE == "openvino":
+        import ov_demucs
+        if ov_demucs.is_supported_model(config.DEMUCS_MODEL):
+            yield from _run_demucs_ov(audio_file)
+            return
+        print(f"⚠️ 模型 {config.DEMUCS_MODEL} 不支持 OpenVINO GPU hybrid"
+              f"（仅支持 {'/'.join(ov_demucs.SUPPORTED_MODELS)}），本次分离回退 demucs CLI（CPU）",
+              flush=True)
     yield None, None, f"🎵 开始人声分离（模型: {config.DEMUCS_MODEL}）..."
     start = time.time()
     try:
@@ -94,8 +150,12 @@ def _run_demucs(audio_file):
         vocal_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_vocals.mp3")
         accomp_path = os.path.join(config.OUTPUT_DIR, f"{base_name}_accomp.mp3")
 
+        # [TEMP-SHIFTS-20261124] 显式关闭 shift trick（demucs 默认 --shifts 2 = 同一首推理 3 遍取平均）
+        # 和降低 overlap（默认 0.25 → 0.1），单首 4 分钟歌从 ~8-10 分钟降到 ~2.5-3 分钟。
+        # 伴奏用途下质量影响可接受；质量不达标可回退（删掉这两个参数即恢复默认）。
         cmd = ["python3", "-m", "demucs", "--two-stems", "vocals",
-               "-n", config.DEMUCS_MODEL, "--mp3", "-o", config.OUTPUT_DIR]
+               "-n", config.DEMUCS_MODEL, "--mp3", "-o", config.OUTPUT_DIR,
+               "--shifts", "0", "--overlap", "0.1"]
         if config.DEMUCS_DEVICE and config.DEMUCS_DEVICE != "openvino":
             cmd.extend(["-d", config.DEMUCS_DEVICE])
         cmd.append(audio_file)
