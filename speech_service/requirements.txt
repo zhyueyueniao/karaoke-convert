@@ -1,0 +1,30 @@
+# 公共依赖清单（Dockerfile 不再直接 COPY 本文件——见下方版本冲突说明）
+# ⚠️ qwen-tts 钉 transformers==4.57.3，qwen-asr 钉 transformers==4.57.6，
+#    同一 venv 无法共存解析。Dockerfile 的做法：
+#    1) torch/torchaudio CPU 轮子走阿里云 pytorch-wheels 镜像
+#    2) 公共依赖统一安装（transformers 固定 4.57.6）
+#    3) qwen-tts、qwen-asr 以 --no-deps 安装
+openvino>=2025.4.0
+nncf
+transformers==4.57.6
+accelerate==1.12.0
+huggingface_hub
+numpy
+soundfile
+librosa
+modelscope
+fastapi
+uvicorn
+python-multipart
+einops
+onnxruntime
+qwen-omni-utils
+nagisa==0.2.11
+soynlp==0.0.493
+pytz
+flask
+gradio
+sox
+# 以下两个 --no-deps 安装（不写在本文件）
+# qwen-tts
+# qwen-asr
