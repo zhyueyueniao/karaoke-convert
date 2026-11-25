@@ -1,5 +1,6 @@
 import gc
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any, Optional
@@ -1445,23 +1446,67 @@ class OVQwen3TTSTalkerForConditionalGeneration(GenerationMixin):
             last_id_hidden = self.get_input_embeddings()(input_ids)
 
             # Run code predictor to generate residual codes
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
-                do_sample=subtalker_dosample if subtalker_dosample is not None else False,
-                top_p=subtalker_top_p,
-                top_k=subtalker_top_k,
-                temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
+            # 快速路径：绕过 HF generate 编排开销（每帧 15 步，每步走完整
+            # GenerationMixin 流水线：校验、logits warper 对象、张量拼接、
+            # kwargs 更新），直接循环调 forward。采样逻辑与 HF 默认 warper
+            # 链严格等价（temperature → top_k → top_p → multinomial，同一
+            # RNG 流），固定步数无 EOS 停止逻辑，行为不变纯提速。
+            _sub_sample = subtalker_dosample if subtalker_dosample is not None else False
+            embeds = torch.cat((past_hidden, last_id_hidden), dim=1)
+            seq_len = embeds.shape[1]
+            attn_mask = torch.ones((1, seq_len), dtype=torch.long)
+            pos_ids = torch.arange(seq_len).unsqueeze(0)
+            residual_ids = []
+            _t = subtalker_temperature if subtalker_temperature is not None else 1.0
+            _k = subtalker_top_k if subtalker_top_k is not None else 50
+            _p = subtalker_top_p if subtalker_top_p is not None else 1.0
+            for step in range(self.config.num_code_groups - 1):
+                if step == 0:
+                    out = self.code_predictor(
+                        inputs_embeds=embeds,
+                        attention_mask=attn_mask,
+                        position_ids=pos_ids,
+                        past_key_values=None,
+                    )
+                else:
+                    out = self.code_predictor(
+                        input_ids=next_id,
+                        attention_mask=attn_mask,
+                        position_ids=pos_ids,
+                        past_key_values=((),),
+                        generation_steps=out.generation_steps,
+                    )
+                logits = out.logits[:, -1, :]
+                if _sub_sample:
+                    if _t != 1.0:
+                        logits = logits / _t
+                    if _k and _k > 0:
+                        k = min(_k, logits.size(-1))
+                        logits[logits < torch.topk(logits, k, dim=-1)[0][..., -1, None]] = float("-inf")
+                    if _p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                        cumulative = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        remove = cumulative > _p
+                        remove[..., 1:] = remove[..., :-1].clone()
+                        remove[..., 0] = False
+                        logits[remove.scatter(-1, sorted_indices, remove)] = float("-inf")
+                    next_id = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+                else:
+                    next_id = logits.argmax(dim=-1, keepdim=True)
+                residual_ids.append(next_id)
+                attn_mask = torch.cat((attn_mask, attn_mask.new_ones((1, 1))), dim=1)
+                pos_ids = pos_ids.new_full((1, 1), seq_len)
+                seq_len += 1
+            predictor_sequences = torch.cat(residual_ids, dim=-1)
 
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+            codec_ids = torch.cat((input_ids, predictor_sequences), dim=-1)
 
             # Aggregate codec embeddings
+            # 注意：embedding IR 的 generation_steps 是标量静态形状（shape=[]），
+            # 无法批量传 [15] 向量（GPU 插件报 shape incompatible），只能逐 token 查表
             codec_hiddens = torch.cat(
                 [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()(predictor_result.sequences[..., i : i + 1], i) for i in range(self.config.num_code_groups - 1)],
+                + [self.code_predictor.get_input_embeddings()(predictor_sequences[..., i : i + 1], i) for i in range(self.config.num_code_groups - 1)],
                 dim=1,
             )
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
@@ -1633,7 +1678,10 @@ class OVQwen3TTSSpeechTokenizer:
         self.decoder_model = None
         decoder_path = self.model_dir / SPEECH_TOKENIZER_DECODER_NAME
         if decoder_path.exists():
-            self.decoder_model = core.compile_model(decoder_path, device)
+            # decoder 必须走 GPU：实测 CPU 解码 ~8s（GPU 仅 0.86s），核显固定开销远小于 CPU 算力差距
+            self.decoder_model = core.compile_model(
+                decoder_path, device, config={"PERFORMANCE_HINT": "LATENCY"}
+            )
 
         # Load config
         config_path = self.model_dir / "config.json"
@@ -1765,7 +1813,9 @@ class OVQwen3TTSSpeechTokenizer:
             chunk = codes_np[:, start - ctx : end, :]
             chunk_len = chunk.shape[1]
 
-            # Pad to DECODER_TRACE_LEN if chunk is shorter
+            # The decoder was traced with a fixed length of DECODER_TRACE_LEN
+            # tokens. If the chunk is shorter, pad with zeros to the trace
+            # length (the trace was done with a batch of 1).
             if chunk_len < self.DECODER_TRACE_LEN:
                 pad = np.zeros((1, self.DECODER_TRACE_LEN - chunk_len, codes_np.shape[2]), dtype=np.int64)
                 chunk = np.concatenate([chunk, pad], axis=1)
@@ -2195,7 +2245,8 @@ class OVQwen3TTSModel:
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
-        # Generate talker codes
+        # Generate talker codes（分段计时：token 生成是自回归逐 token，vocoder 是一次性解码）
+        _t0 = time.time()
         talker_codes_list = self._generate_talker_codes(
             input_ids=input_ids,
             instruct_ids=instruct_ids,
@@ -2204,12 +2255,20 @@ class OVQwen3TTSModel:
             non_streaming_mode=non_streaming_mode,
             **gen_kwargs,
         )
+        _t1 = time.time()
 
         # Decode codes to waveforms
         if self.speech_tokenizer is None:
             raise RuntimeError("Speech tokenizer not loaded. Cannot decode audio.")
 
         wavs, fs = self.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
+        _t2 = time.time()
+        try:
+            _codes = sum(len(c) for c in talker_codes_list)
+            _audio_s = sum(len(w) for w in wavs) / fs if fs else 0
+            print(f"⏱️ [TTS分段] token生成 {_t1 - _t0:.2f}s（{_codes} codes）| vocoder {_t2 - _t1:.2f}s | 音频 {_audio_s:.2f}s", flush=True)
+        except Exception:
+            pass  # 计时统计不影响合成主流程
         return wavs, fs
 
     @torch.inference_mode()

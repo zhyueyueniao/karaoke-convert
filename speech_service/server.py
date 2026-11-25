@@ -1,8 +1,8 @@
 """Qwen3 语音 sidecar：ASR（高精度识别）+ TTS（语音合成/音色克隆）独立容器
 
-独立于主服务的 FastAPI 服务，模型惰性后台加载：
-  - ASR / TTS(CustomVoice) 启动即预载（两模型 fp16 常驻约 8-9GB）
-  - TTS Base（音色克隆用）惰性加载：首次克隆请求时才加载（约 3.8GB），平时不占内存
+独立于主服务的 FastAPI 服务，三模型均惰性加载 + 空闲自动卸载释放内存：
+  - ASR / TTS(CustomVoice) 首次请求时加载，空闲超 SPEECH_IDLE_UNLOAD 分钟（默认 10）自动卸载
+  - TTS Base（音色克隆用）首次克隆请求时加载，空闲超 TTS_BASE_IDLE_UNLOAD 分钟（默认 30）自动卸载
 
 端点：
   GET  /health           健康检查（设备/三模型就绪状态）
@@ -32,6 +32,7 @@ x-vector 模式仅需 ref_audio（x_vector_only=true）。参考音频建议 ≥
 鉴权：设置 SPEECH_TOKEN 后除 /health 外均需请求头 X-Speech-Token。
 设备：SPEECH_DEVICE=CPU|GPU|NPU，留空自动探测（GPU 优先，失败回退 CPU）。
 """
+import gc
 import io
 import os
 import re
@@ -61,6 +62,7 @@ SPEECH_DEVICE = os.environ.get("SPEECH_DEVICE", "").strip().upper()  # 空 = 自
 TTS_LOAD_TIMEOUT = float(os.environ.get("TTS_LOAD_TIMEOUT", "2700"))  # 等待模型就绪秒数（自动下载串行转换时首请求会等待较久）
 TTS_BASE_LOAD_TIMEOUT = float(os.environ.get("TTS_BASE_LOAD_TIMEOUT", "3000"))  # Base 惰性加载（含首次下载）
 TTS_BASE_IDLE_UNLOAD = float(os.environ.get("TTS_BASE_IDLE_UNLOAD", "30"))  # Base 空闲卸载阈值（分钟，0=常驻）
+IDLE_UNLOAD_MIN = float(os.environ.get("SPEECH_IDLE_UNLOAD", "10"))  # TTS/ASR 空闲卸载阈值（分钟，0=常驻）
 # TTS int8 权重压缩（SPEECH_TTS_INT8=0 关闭）：加载前对 fp16 IR 做 nncf int8 压缩（原地覆盖+标记）。
 # 逐 token 自回归生成受内存带宽限制，int8 预计提速 1.5-2 倍；只压 talker 语言模型（耗时大头），
 # 首次加载多花 1-3 分钟做一次性压缩，之后直接用压缩产物
@@ -136,7 +138,7 @@ _EXPECTED_IR = {
             "thinker/openvino_thinker_embedding_model.xml", "thinker/openvino_thinker_embedding_model.bin"],
 }
 
-# Qwen3-TTS-12Hz-1.7B-CustomVoice 官方 9 内置音色（无克隆功能）
+# CustomVoice 官方 9 内置音色（1.7B / 0.6B 相同，无克隆功能）
 VOICES = [
     {"id": "Vivian",   "desc": "明亮女声（中文）"},
     {"id": "Serena",   "desc": "温柔女声（中文）"},
@@ -164,13 +166,18 @@ def _pick_device() -> str:
 DEVICE = _pick_device()
 
 # ======================== 模型持有与惰性加载 ========================
+# TTS/ASR 主模型：首次请求惰性加载；空闲超阈值自动卸载释放内存（SPEECH_IDLE_UNLOAD=0 常驻）
 _tts_model = None
 _tts_error: str | None = None
 _tts_ready = threading.Event()
+_tts_loading = False
+_tts_last_used = 0.0  # 最近一次合成完成的时间戳（0=从未使用）
 
 _asr_model = None
 _asr_error: str | None = None
 _asr_ready = threading.Event()
+_asr_loading = False
+_asr_last_used = 0.0  # 最近一次识别完成的时间戳（0=从未使用）
 
 # TTS Base（克隆用）：惰性加载，首次 /tts/clone 请求时触发；空闲超阈值自动卸载释放内存
 _tts_base_model = None
@@ -186,8 +193,11 @@ _asr_slots = threading.BoundedSemaphore(2)
 
 def _load_tts():
     """[后台线程] 加载 TTS OpenVINO IR；产物缺失/损坏且开启自动下载时先下载+转换"""
-    global _tts_model, _tts_error
+    global _tts_model, _tts_error, _tts_loading
     with _LOAD_CHAIN:
+        if _tts_ready.is_set():  # 排队期间已被其他线程加载，避免重复加载泄漏
+            return
+        _tts_loading = True
         try:
             _ensure_ir("tts")
             _compress_ir_int8("tts")
@@ -199,12 +209,17 @@ def _load_tts():
         except Exception as e:
             _tts_error = f"TTS 模型加载失败: {e}"
             print(f"❌ [TTS] {_tts_error}", flush=True)
+        finally:
+            _tts_loading = False
 
 
 def _load_asr():
     """[后台线程] 加载 ASR OpenVINO IR；产物缺失/损坏且开启自动下载时先下载+转换"""
-    global _asr_model, _asr_error
+    global _asr_model, _asr_error, _asr_loading
     with _LOAD_CHAIN:
+        if _asr_ready.is_set():
+            return
+        _asr_loading = True
         try:
             _ensure_ir("asr")
             print(f"🔄 [ASR] 加载 OpenVINO IR ({DEVICE})...", flush=True)
@@ -215,6 +230,24 @@ def _load_asr():
         except Exception as e:
             _asr_error = f"ASR 模型加载失败: {e}"
             print(f"❌ [ASR] {_asr_error}", flush=True)
+        finally:
+            _asr_loading = False
+
+
+def _ensure_tts():
+    """[惰性触发] TTS 未加载时启动后台加载线程（幂等）"""
+    global _tts_last_used
+    if _tts_model is None and not _tts_loading:
+        _tts_last_used = time.time()  # 视为「刚被需要」，避免空闲卸载器刚加载完就把它卸了
+        threading.Thread(target=_load_tts, daemon=True).start()
+
+
+def _ensure_asr():
+    """[惰性触发] ASR 未加载时启动后台加载线程（幂等）"""
+    global _asr_last_used
+    if _asr_model is None and not _asr_loading:
+        _asr_last_used = time.time()
+        threading.Thread(target=_load_asr, daemon=True).start()
 
 
 def _load_tts_base():
@@ -245,39 +278,61 @@ def _ensure_tts_base():
         threading.Thread(target=_load_tts_base, daemon=True).start()
 
 
-def _tts_base_idle_watcher():
-    """[后台线程] Base 模型空闲自动卸载：闲置超过 TTS_BASE_IDLE_UNLOAD 分钟释放约 3.8GB 内存
+def _idle_unload_watcher():
+    """[后台线程] 三模型空闲自动卸载：闲置超阈值释放内存，下次请求惰性重新加载
 
-    - 仅在无请求正在合成时卸载（拿不到 _tts_slots 说明有合成进行中，跳过本轮）
-    - 下次克隆/使用克隆音色时 _ensure_tts_base 会自动重新加载（需 1-2 分钟）
-    - TTS_BASE_IDLE_UNLOAD=0 时本线程不启动（常驻策略）
+    - TTS/ASR 阈值 SPEECH_IDLE_UNLOAD（默认 10 分钟），Base 阈值 TTS_BASE_IDLE_UNLOAD（默认 30），0=常驻
+    - 仅在无请求正在推理时卸载（拿不到并发槽说明有推理进行中，跳过本轮）
+    - ASR 需拿满 2 个槽才卸载，避免与进行中的转写并发
     """
-    global _tts_base_last_used
-    if TTS_BASE_IDLE_UNLOAD <= 0:
-        return
     while True:
         time.sleep(60)
-        if _tts_base_model is None or not _tts_base_ready.is_set():
-            continue
-        idle_min = (time.time() - _tts_base_last_used) / 60
-        if _tts_base_last_used > 0 and idle_min >= TTS_BASE_IDLE_UNLOAD:
-            if _tts_slots.acquire(blocking=False):
-                try:
-                    if _tts_base_model is not None and _tts_base_ready.is_set():
-                        _unload("tts-base")
-                        print(f"💤 [TTS-Base] 空闲 {idle_min:.0f} 分钟，已卸载释放内存"
-                              f"（下次克隆自动重新加载）", flush=True)
-                finally:
-                    _tts_slots.release()
+        if IDLE_UNLOAD_MIN > 0:
+            if _tts_model is not None and _tts_ready.is_set() and _tts_last_used > 0:
+                idle_min = (time.time() - _tts_last_used) / 60
+                if idle_min >= IDLE_UNLOAD_MIN and _tts_slots.acquire(blocking=False):
+                    try:
+                        if _tts_model is not None and _tts_ready.is_set():
+                            _unload("tts")
+                            print(f"💤 [TTS] 空闲 {idle_min:.0f} 分钟，已卸载释放内存"
+                                  f"（下次合成自动重新加载）", flush=True)
+                    finally:
+                        _tts_slots.release()
+            if _asr_model is not None and _asr_ready.is_set() and _asr_last_used > 0:
+                idle_min = (time.time() - _asr_last_used) / 60
+                if idle_min >= IDLE_UNLOAD_MIN and _asr_slots.acquire(blocking=False):
+                    got_second = _asr_slots.acquire(blocking=False)
+                    try:
+                        if got_second and _asr_model is not None and _asr_ready.is_set():
+                            _unload("asr")
+                            print(f"💤 [ASR] 空闲 {idle_min:.0f} 分钟，已卸载释放内存"
+                                  f"（下次识别自动重新加载）", flush=True)
+                    finally:
+                        if got_second:
+                            _asr_slots.release()
+                        _asr_slots.release()
+        if TTS_BASE_IDLE_UNLOAD > 0 and _tts_base_model is not None and _tts_base_ready.is_set():
+            idle_min = (time.time() - _tts_base_last_used) / 60
+            if _tts_base_last_used > 0 and idle_min >= TTS_BASE_IDLE_UNLOAD:
+                if _tts_slots.acquire(blocking=False):
+                    try:
+                        if _tts_base_model is not None and _tts_base_ready.is_set():
+                            _unload("tts-base")
+                            print(f"💤 [TTS-Base] 空闲 {idle_min:.0f} 分钟，已卸载释放内存"
+                                  f"（下次克隆自动重新加载）", flush=True)
+                    finally:
+                        _tts_slots.release()
 
 
 def _unload(kind: str):
-    """卸载内存模型实例（删除模型/强制重下前调用）"""
+    """卸载内存实例（空闲自动释放/删除模型/强制重下前调用）；gc 强制回收 OV 权重内存"""
     global _tts_model, _asr_model, _tts_error, _asr_error, _tts_base_model, _tts_base_error, _tts_base_loading
+    global _tts_loading, _asr_loading
     if kind == "tts":
         _tts_model = None
         _tts_error = None
         _tts_ready.clear()
+        _tts_loading = False
         print("🗑 [TTS] 内存实例已卸载", flush=True)
     elif kind == "tts-base":
         _tts_base_model = None
@@ -289,7 +344,9 @@ def _unload(kind: str):
         _asr_model = None
         _asr_error = None
         _asr_ready.clear()
+        _asr_loading = False
         print("🗑 [ASR] 内存实例已卸载", flush=True)
+    gc.collect()
 
 
 app = FastAPI(title="Qwen3 Speech Sidecar (ASR+TTS)")
@@ -447,8 +504,15 @@ def _download_and_convert(kind: str, on_line=None) -> None:
             raise RuntimeError(f"下载完成但未找到权重目录 {ckpt}")
         emit("🧠 转换 OpenVINO IR（需数分钟，全局串行防 OOM）...")
         with _CONV_LOCK:
-            for line in _run_streaming([sys.executable, "-u", "-c", _conv_script(kind)]):
-                emit(f"🧠 {line}")
+            # tts 先单独转 speech tokenizer（峰值内存最小），再跑全量脚本转 talker
+            # （tokenizer 产物已存在时全量脚本内自动跳过）；asr 单脚本即可
+            scripts = []
+            if kind in ("tts", "tts-base") and os.path.isdir(os.path.join(ckpt, "speech_tokenizer")):
+                scripts.append(_tokenizer_conv_script(kind))
+            scripts.append(_conv_script(kind))
+            for script in scripts:
+                for line in _run_streaming([sys.executable, "-u", "-c", script]):
+                    emit(f"🧠 {line}")
             if not os.path.isdir(ov_dir):
                 raise RuntimeError(f"转换完成但未找到 IR 目录 {ov_dir}")
             _validate_ir(kind)  # 锁内校验：不完整即失败并清理，防半成品
@@ -463,39 +527,78 @@ def _download_and_convert(kind: str, on_line=None) -> None:
         lock.release()
 
 
-# int8 权重压缩目标（相对 ov 目录、不带扩展名）：仅 talker 语言模型（自回归逐 token 生成的耗时大头）
+# int8 权重压缩目标（相对 ov 目录、不带扩展名）：talker 语言模型 + code predictor。
+# talker 是自回归逐 token 的耗时大头；code predictor 每个音频帧被调用 3-4 次（每帧
+# 生成 num_code_groups-1 个残差码），稳态实测占 token 生成耗时约一半，同样压缩
 _INT8_TARGETS = {
-    "tts": ["openvino_talker_language_model"],
-    "tts-base": ["openvino_talker_language_model"],
+    "tts": ["openvino_talker_language_model", "openvino_talker_code_predictor_model"],
+    "tts-base": ["openvino_talker_language_model", "openvino_talker_code_predictor_model"],
 }
 
 
+# int8 压缩子进程脚本：nncf 压缩 + 量化期间 fp16/int8 权重共存，峰值内存 12G+，
+# 在主进程跑会连累整个服务被宿主 OOM 杀死（实测容器反复重启），故放独立子进程；
+# 先写 .int8tmp 临时文件再原子替换，中途被杀也不会毁掉 fp16 原产物（避免触发重转循环）
+_INT8_CONV_TPL = """\
+import os, sys, time
+sys.path.insert(0, r'{helper_dir}')
+import openvino as ov
+import nncf
+core = ov.Core()
+xml = r'{xml}'
+bin_path = r'{bin_path}'
+# save_model 强制要求 .xml 扩展名，故先写到 ov 目录下的 .int8tmp 临时目录再原子替换
+tmp_dir = os.path.join(os.path.dirname(xml), '.int8tmp')
+os.makedirs(tmp_dir, exist_ok=True)
+tmp_xml = os.path.join(tmp_dir, os.path.basename(xml))
+tmp_bin = os.path.join(tmp_dir, os.path.basename(bin_path))
+t0 = time.time()
+m = core.read_model(xml)
+c = nncf.compress_weights(m, mode=nncf.CompressWeightsMode.INT8_ASYM, group_size=-1)
+ov.save_model(c, tmp_xml)
+os.replace(tmp_xml, xml)
+os.replace(tmp_bin, bin_path)
+os.rmdir(tmp_dir)
+print(f'INT8_DONE {{time.time() - t0:.0f}}s', flush=True)
+"""
+
+
 def _compress_ir_int8(kind: str) -> None:
-    """加载前对 fp16 IR 做 nncf int8 权重压缩（原地覆盖，.int8 标记防重复；失败降级 fp16 不阻塞加载）"""
+    """加载前对 fp16 IR 做 nncf int8 权重压缩（子进程执行+原子替换，按目标标记防重复；失败降级 fp16 不阻塞加载）"""
     targets = _INT8_TARGETS.get(kind)
     if not targets or not TTS_INT8:
         return
     _, _, ov_dir = MODEL_KINDS[kind]
     if not os.path.isdir(ov_dir):
         return
-    if os.path.isfile(os.path.join(ov_dir, ".int8")):
-        return  # 已压缩过
-    try:
-        import nncf
-        core = ov.Core()
-        for name in targets:
-            xml = os.path.join(ov_dir, name + ".xml")
-            if not os.path.isfile(xml):
-                continue
-            print(f"🗜️ [{kind}] int8 权重压缩 {name}（一次性，约 1-3 分钟）...", flush=True)
-            t0 = time.time()
-            m = core.read_model(xml)
-            ov.save_model(nncf.compress_weights(m, mode=nncf.CompressWeightsMode.INT8_ASYM, group_size=-1), xml)
-            print(f"✅ [{kind}] {name} int8 压缩完成（{time.time() - t0:.0f}s）", flush=True)
-        with open(os.path.join(ov_dir, ".int8"), "w", encoding="utf-8") as f:
-            f.write("ok")
-    except Exception as e:  # noqa: BLE001
-        print(f"⚠️ [{kind}] int8 压缩失败（{e}），继续使用 fp16", flush=True)
+    helper_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in targets:
+        # 按目标单独标记：历史版本只压了 talker（已写 .int8 标记），加新目标后
+        # 只对未压缩的产物补压，避免对已 int8 的 bin 二次量化（既变慢又损精度）
+        if os.path.isfile(os.path.join(ov_dir, f".int8.{name}")):
+            continue
+        xml = os.path.join(ov_dir, name + ".xml")
+        if not os.path.isfile(xml):
+            continue
+        script = _INT8_CONV_TPL.format(helper_dir=helper_dir, xml=xml,
+                                       bin_path=os.path.join(ov_dir, name + ".bin"))
+        print(f"🗜️ [{kind}] int8 权重压缩 {name}（一次性，约 1-3 分钟）...", flush=True)
+        try:
+            for line in _run_streaming([sys.executable, "-u", "-c", script]):
+                print(f"🗜️ [{kind}] {line}", flush=True)
+            print(f"✅ [{kind}] {name} int8 压缩完成", flush=True)
+            with open(os.path.join(ov_dir, f".int8.{name}"), "w", encoding="utf-8") as f:
+                f.write("ok")
+        except Exception as e:  # noqa: BLE001
+            # 子进程被 OOM 杀死等场景：fp16 原产物仍在（临时目录原子替换保证），降级 fp16 加载
+            tmp_dir = os.path.join(ov_dir, ".int8tmp")
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            print(f"⚠️ [{kind}] int8 压缩失败（{e}），{name} 继续使用 fp16", flush=True)
+            return
+    # 兼容历史标记：全部目标就绪后写总标记（旧版 .int8 无按目标标记）
+    with open(os.path.join(ov_dir, ".int8"), "w", encoding="utf-8") as f:
+        f.write("ok")
 
 
 # ======================== 自定义（克隆）音色管理 ========================
@@ -572,15 +675,20 @@ def _save_ref_as_voice(src_path: str, name: str, ref_text: str | None) -> dict:
 
 def _auto_ref_text(ref_wav: str) -> str | None:
     """用已就绪的 Qwen3-ASR 自动转写参考音频（供 ICL 克隆模式）；未就绪/失败返回 None"""
+    global _asr_last_used
     try:
         if not _asr_ready.is_set():
             return None
         if not _asr_slots.acquire(blocking=False):
             return None
+        if _asr_model is None:
+            _asr_slots.release()
+            return None
         try:
             results = _asr_model.transcribe(ref_wav, language=None)
         finally:
             _asr_slots.release()
+        _asr_last_used = time.time()
         return (results[0].text.strip() or None) if results else None
     except Exception as e:  # noqa: BLE001
         print(f"⚠️ 参考音频自动转写失败: {e}", flush=True)
@@ -664,6 +772,26 @@ def _conv_script(kind: str) -> str:
     helper_mod = "qwen_3_tts_helper" if kind in ("tts", "tts-base") else "qwen_3_asr_helper"
     return _CONV_TPL.format(helper_dir=helper_dir, helper_mod=helper_mod,
                             convert_fn=convert_fn, ckpt=ckpt, out=out)
+
+
+# speech tokenizer 独立转换脚本：合并转换时 decoder 阶段进程内仍持有原始模型+talker 导出残留
+# （fp16 峰值 12G+），实测在 16G/24G 限额下均被 OOM 杀死（exit=-9）。拆成独立子进程后
+# 峰值降到约 4G；先单独转 tokenizer，再跑全量脚本（talker 转完后 tokenizer 因产物已存在自动跳过）
+_TOKENIZER_CONV_TPL = """\
+import sys
+sys.path.insert(0, r'{helper_dir}')
+from qwen_3_tts_helper import convert_speech_tokenizer
+convert_speech_tokenizer(r'{tok_dir}', r'{out}')
+print('CONVERT_DONE', flush=True)
+"""
+
+
+def _tokenizer_conv_script(kind: str) -> str:
+    helper_dir = os.path.dirname(os.path.abspath(__file__))
+    _model_id, ckpt, out = MODEL_KINDS[kind]
+    tok_dir = os.path.join(ckpt, "speech_tokenizer")
+    return _TOKENIZER_CONV_TPL.format(helper_dir=helper_dir, tok_dir=tok_dir,
+                                      out=os.path.join(out, "speech_tokenizer"))
 
 
 # ======================== 端点 ========================
@@ -867,12 +995,17 @@ def tts_synthesize(body: dict):
         return _clone_wav_response(text, ref_wav, ref_text, language,
                                    x_vector_only=not ref_text, started=time.monotonic())
 
+    global _tts_last_used
+    _ensure_tts()
     detail = _wait_or_detail("tts", _tts_ready, TTS_LOAD_TIMEOUT)
     if detail:
         raise HTTPException(503, detail)
 
     if not _tts_slots.acquire(blocking=False):
         raise HTTPException(429, "TTS 合成并发已满，请稍后重试")
+    if _tts_model is None:  # 等待就绪与拿槽之间被空闲卸载器释放，重试即触发惰性重载
+        _tts_slots.release()
+        raise HTTPException(503, "TTS 模型刚被空闲释放，请重试（自动重新加载）")
     started = time.monotonic()
     try:
         segments = _split_sentences(text)
@@ -890,6 +1023,7 @@ def tts_synthesize(body: dict):
         buf = io.BytesIO()
         sf.write(buf, audio, fs, format="WAV")
         elapsed = int((time.monotonic() - started) * 1000)
+        _tts_last_used = time.time()
         print(f"🔊 TTS 完成: {len(segments)} 段 {len(audio)/fs:.1f}s 耗时 {elapsed}ms", flush=True)
         return Response(content=buf.getvalue(), media_type="audio/wav",
                         headers={"X-Elapsed-Ms": str(elapsed), "X-Segments": str(len(segments))})
@@ -979,6 +1113,7 @@ def asr_transcribe(file: UploadFile = File(...)):
 
     注：OV 版 transcribe 不返回时间戳（return_time_stamps 不支持），仅纯文本。
     """
+    global _asr_last_used
     started = time.monotonic()
     suffix = os.path.splitext(file.filename or "audio")[1][:16] or ".webm"
     fd, src, wav_path = None, None, None
@@ -999,11 +1134,15 @@ def asr_transcribe(file: UploadFile = File(...)):
         os.remove(src)
         src = None  # 原始上传文件已可删除，16k wav 转写完成后再清
 
+        _ensure_asr()
         detail = _wait_or_detail("asr", _asr_ready, ASR_LOAD_TIMEOUT)
         if detail:
             raise HTTPException(503, detail)
         if not _asr_slots.acquire(blocking=False):
             raise HTTPException(429, "ASR 并发已满，请稍后重试")
+        if _asr_model is None:  # 等待就绪与拿槽之间被空闲卸载器释放，重试即触发惰性重载
+            _asr_slots.release()
+            raise HTTPException(503, "ASR 模型刚被空闲释放，请重试（自动重新加载）")
         try:
             results = _asr_model.transcribe(wav_path, language=None)  # 自动检测语言
         finally:
@@ -1013,6 +1152,7 @@ def asr_transcribe(file: UploadFile = File(...)):
             raise HTTPException(400, "未识别到语音，请重试")
         os.remove(wav_path)  # 转写完成即清理，防临时文件累积
         elapsed = int((time.monotonic() - started) * 1000)
+        _asr_last_used = time.time()
         print(f"🗣️ ASR 完成: {len(text)} 字 耗时 {elapsed}ms", flush=True)
         return {"text": text, "language": results[0].language, "elapsed_ms": elapsed}
     except HTTPException:
@@ -1033,10 +1173,8 @@ def asr_transcribe(file: UploadFile = File(...)):
 
 
 if __name__ == "__main__":
-    # 启动即后台预载两模型（fp16 常驻约 8-9GB；克隆用 Base 模型按需惰性加载）
-    threading.Thread(target=_load_tts, daemon=True).start()
-    threading.Thread(target=_load_asr, daemon=True).start()
-    # Base 模型空闲自动卸载器（TTS_BASE_IDLE_UNLOAD>0 时生效，默认 30 分钟）
-    threading.Thread(target=_tts_base_idle_watcher, daemon=True).start()
+    # 三模型均惰性加载：首次请求触发，空闲超阈值自动卸载释放内存
+    # （SPEECH_IDLE_UNLOAD=0 / TTS_BASE_IDLE_UNLOAD=0 时对应模型常驻）
+    threading.Thread(target=_idle_unload_watcher, daemon=True).start()
     print(f"🚀 speech sidecar 启动 http://0.0.0.0:7862/health (device={DEVICE})", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=7862)
